@@ -20,7 +20,12 @@ compact defaults with `verbose=True` escape hatches where response size matters.
   `SchwabServerContext.pending_approvals`, and refuses more with
   `PermissionError` before the backend is contacted. The previewed-order
   executors call `ensure_approval_capacity()` before consuming the preview,
-  so a refusal leaves it usable.
+  so a refusal leaves it usable. After an approved write, `report_outcome()`
+  sends the reviewer one outcome line through the approval manager (bounded
+  by `_OUTCOME_REPORT_TIMEOUT_SECONDS`; failures are logged, never raised).
+  Wrapped write tools report `completed` or `failed: <error>`;
+  `describe_write_error()` shows a Schwab error's status and body, not its
+  URL.
 - `_protocols.py` defines Protocol facades for each Schwab client namespace
   (`accounts`, `orders`, `quotes`, `options`, `price_history`, etc.). These keep
   `SchwabContext` access type-checkable without coupling tool code to concrete
@@ -90,7 +95,11 @@ compact defaults with `verbose=True` escape hatches where response size matters.
     faithfully fail the preview. Replacement target IDs reject URL-unsafe
     values. A failed
     status fetch, including an HTTP transport failure, preserves the successful
-    write response as a fallback. `cancel_order()` validates both identifiers
+    write response as a fallback. Place, replace and cancel run the write
+    through `_run_order_write()`, which reports the order id and Schwab status
+    (with `statusDescription`, now kept in pruned orders) or the write error to
+    the reviewer, with the account hash shortened to its last four
+    characters. `cancel_order()` validates both identifiers
     before custom approval and the cancel request, and preserves its fallback
     when status lookup fails with an API, parsing, or transport error.
 

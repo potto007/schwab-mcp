@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -45,6 +46,28 @@ def format_arguments(arguments: Mapping[str, str]) -> str:
     lines = [f"{key} = {value}" for key, value in arguments.items()]
     body = "\n".join(lines).replace("`", "ˋ")
     return f"```\n{body}\n```"
+
+
+def format_outcome(outcome: str, limit: int) -> str:
+    """Render a write outcome as one inert line of at most ``limit`` characters.
+
+    Outcomes carry Schwab error bodies and exception text, so they are treated
+    like any other untrusted text: control characters become spaces,
+    invisible formatting characters (bidi overrides, zero-width joiners) are
+    dropped, and backticks are swapped for a look-alike so a markdown fence
+    around the line cannot be closed early.
+    """
+    chars: list[str] = []
+    for char in outcome:
+        category = unicodedata.category(char)
+        if category == "Cc":
+            chars.append(" ")
+        elif category != "Cf":
+            chars.append(char)
+    text = "".join(chars).replace("`", "ˋ")
+    if len(text) > limit:
+        return text[: limit - 1] + "…"
+    return text
 
 
 def parse_account_names(values: Sequence[str] | None) -> Mapping[str, str]:
@@ -92,6 +115,21 @@ class ApprovalManager(abc.ABC):
     async def require(self, request: ApprovalRequest) -> ApprovalDecision:
         """Require approval for the provided request."""
 
+    async def report_outcome(  # noqa: B027
+        self,
+        request: ApprovalRequest,
+        outcome: str,
+        *,
+        succeeded: bool,
+    ) -> None:
+        """Tell the reviewer what an approved write did.
+
+        Called once per approved write, after it runs. ``outcome`` is one
+        line built by the tool (order id and status, or the error). Backends
+        without a reviewer channel ignore it. Callers treat this as best
+        effort: an exception here is logged, never surfaced to the tool.
+        """
+
 
 class NoOpApprovalManager(ApprovalManager):
     """Approval manager that always approves requests."""
@@ -107,5 +145,6 @@ __all__ = [
     "ApprovalRequest",
     "NoOpApprovalManager",
     "format_arguments",
+    "format_outcome",
     "parse_account_names",
 ]

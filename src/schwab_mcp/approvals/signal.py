@@ -19,6 +19,7 @@ from schwab_mcp.approvals.base import (
     ApprovalManager,
     ApprovalRequest,
     format_arguments,
+    format_outcome,
     parse_account_names,
 )
 
@@ -195,6 +196,18 @@ class SignalApprovalManager(ApprovalManager):
                 self._pending.pop(sent_timestamp, None)
 
         return decision
+
+    async def report_outcome(
+        self,
+        request: ApprovalRequest,
+        outcome: str,
+        *,
+        succeeded: bool,
+    ) -> None:
+        """Send one notice with the write's outcome, keyed by approval id."""
+        marker = "✅" if succeeded else "⚠️"
+        header = f"{marker} schwab-mcp approval {request.id} for '{request.tool_name}' outcome: "
+        await self._send(header + format_outcome(outcome, _BODY_LIMIT - len(header)))
 
     async def _send(self, body: str) -> int:
         if self._client is None:

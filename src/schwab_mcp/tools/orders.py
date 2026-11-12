@@ -4,7 +4,7 @@ import logging
 import math
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, cast
@@ -34,7 +34,13 @@ from schwab_mcp.context import SchwabContext
 from schwab_mcp.previews import PreviewOperation
 from schwab_mcp.tools._dates import parse_date
 from schwab_mcp.tools._protocols import ToolsClient
-from schwab_mcp.tools._registration import ensure_approval_capacity, register_tool, run_approval
+from schwab_mcp.tools._registration import (
+    describe_write_error,
+    ensure_approval_capacity,
+    register_tool,
+    report_outcome,
+    run_approval,
+)
 from schwab_mcp.tools.order_helpers import (
     equity_buy_limit,
     equity_buy_market,
@@ -66,6 +72,7 @@ _COMPACT_ORDER_TOP_FIELDS = frozenset(
     {
         "orderId",
         "status",
+        "statusDescription",
         "quantity",
         "filledQuantity",
         "remainingQuantity",
@@ -864,6 +871,72 @@ def _order_response_handler(ctx: SchwabContext, account_hash: str) -> ResponseHa
     return handler
 
 
+def _write_outcome(action: str, result: JSONType) -> str:
+    """One line for the reviewer: the order Schwab reports after the write."""
+    if not isinstance(result, dict) or result.get("orderId") is None:
+        return f"{action}: Schwab returned no order id"
+    line = f"{action}: order {result['orderId']}, "
+    status = result.get("status")
+    if status:
+        line += f"status {status}"
+        description = result.get("statusDescription")
+        if description:
+            line += f" ({description})"
+    else:
+        line += "status not confirmed"
+    note = result.get("note")
+    if note:
+        line += f"; {note}"
+    return line
+
+
+async def _report_order_outcome(
+    ctx: SchwabContext,
+    request: ApprovalRequest,
+    account_hash: str,
+    outcome: str,
+    *,
+    succeeded: bool,
+) -> None:
+    # Error text can echo the request URL; show the account the way prompts do.
+    if account_hash:
+        outcome = outcome.replace(account_hash, f"…{account_hash[-4:]}")
+    await report_outcome(ctx, request, outcome, succeeded=succeeded)
+
+
+async def _run_order_write(
+    ctx: SchwabContext,
+    request: ApprovalRequest,
+    account_hash: str,
+    *,
+    verb: str,
+    action: str,
+    write: Callable[[], Awaitable[JSONType]],
+    finish: Callable[[JSONType], Awaitable[JSONType]],
+) -> JSONType:
+    """Run an approved order write, then report what happened to the reviewer.
+
+    ``write`` sends the order to Schwab; ``finish`` fetches its status. A
+    failure in ``write`` is reported as a failure. Once ``write`` succeeded
+    the order exists, so a failure in ``finish`` is still reported as a
+    completed write with an unconfirmed status.
+    """
+    try:
+        written = await write()
+    except Exception as exc:
+        await _report_order_outcome(
+            ctx, request, account_hash, f"{verb} failed: {describe_write_error(exc)}", succeeded=False
+        )
+        raise
+    try:
+        result = await finish(written)
+    except Exception:
+        await _report_order_outcome(ctx, request, account_hash, _write_outcome(action, written), succeeded=True)
+        raise
+    await _report_order_outcome(ctx, request, account_hash, _write_outcome(action, result), succeeded=True)
+    return result
+
+
 async def _post_write_order_result(
     ctx: SchwabContext,
     account_hash: str,
@@ -1475,19 +1548,34 @@ async def cancel_order(
         raise TimeoutError(message)
 
     client = ctx.orders
-    await call(client.cancel_order, order_id=order_id, account_hash=account_hash)
-    fallback: JSONType = {
-        "orderId": order_id,
-        "status": "PENDING_CANCEL",
-        "note": "Cancel submitted; status fetch failed",
-    }
-    try:
-        result = await call(client.get_order, order_id=order_id, account_hash=account_hash)
-    except (SchwabAPIError, ValueError, httpx.TransportError):
-        return fallback
-    if not isinstance(result, dict):
-        return fallback
-    return _prune_order(result)
+
+    async def write() -> JSONType:
+        await call(client.cancel_order, order_id=order_id, account_hash=account_hash)
+        return {"orderId": order_id}
+
+    async def finish(_written: JSONType) -> JSONType:
+        fallback: JSONType = {
+            "orderId": order_id,
+            "status": "PENDING_CANCEL",
+            "note": "Cancel submitted; status fetch failed",
+        }
+        try:
+            result = await call(client.get_order, order_id=order_id, account_hash=account_hash)
+        except (SchwabAPIError, ValueError, httpx.TransportError):
+            return fallback
+        if not isinstance(result, dict):
+            return fallback
+        return _prune_order(result)
+
+    return await _run_order_write(
+        ctx,
+        request,
+        account_hash,
+        verb="cancel",
+        action=f"cancel submitted for order {order_id}",
+        write=write,
+        finish=finish,
+    )
 
 
 async def create_option_symbol(
@@ -1911,13 +1999,21 @@ async def place_previewed_order(
 
     decision = await run_approval(ctx, request)
     if decision is ApprovalDecision.APPROVED:
-        placed = await call(
-            ctx.orders.place_order,
-            account_hash=account_hash,
-            order_spec=entry.order_spec,
-            response_handler=_order_response_handler(ctx, account_hash),
+
+        async def write() -> JSONType:
+            return await call(
+                ctx.orders.place_order,
+                account_hash=account_hash,
+                order_spec=entry.order_spec,
+                response_handler=_order_response_handler(ctx, account_hash),
+            )
+
+        async def finish(placed: JSONType) -> JSONType:
+            return await _post_write_order_result(ctx, account_hash, placed, "Order placed; status fetch failed")
+
+        return await _run_order_write(
+            ctx, request, account_hash, verb="place", action="placed", write=write, finish=finish
         )
-        return await _post_write_order_result(ctx, account_hash, placed, "Order placed; status fetch failed")
 
     message = (
         "Order placement denied by reviewer."
@@ -1970,14 +2066,28 @@ async def replace_previewed_order(
 
     decision = await run_approval(ctx, request)
     if decision is ApprovalDecision.APPROVED:
-        replaced = await call(
-            ctx.orders.replace_order,
-            account_hash=account_hash,
-            order_id=target_order_id,
-            order_spec=entry.order_spec,
-            response_handler=_order_response_handler(ctx, account_hash),
+
+        async def write() -> JSONType:
+            return await call(
+                ctx.orders.replace_order,
+                account_hash=account_hash,
+                order_id=target_order_id,
+                order_spec=entry.order_spec,
+                response_handler=_order_response_handler(ctx, account_hash),
+            )
+
+        async def finish(replaced: JSONType) -> JSONType:
+            return await _post_write_order_result(ctx, account_hash, replaced, "Order replaced; status fetch failed")
+
+        return await _run_order_write(
+            ctx,
+            request,
+            account_hash,
+            verb="replace",
+            action=f"replaced order {target_order_id}",
+            write=write,
+            finish=finish,
         )
-        return await _post_write_order_result(ctx, account_hash, replaced, "Order replaced; status fetch failed")
 
     message = (
         "Order replacement denied by reviewer."

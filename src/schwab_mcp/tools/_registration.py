@@ -18,6 +18,7 @@ from pydantic import ConfigDict, ValidationError
 
 from schwab_mcp.approvals import ApprovalDecision, ApprovalRequest
 from schwab_mcp.context import SchwabContext
+from schwab_mcp.tools.utils import SchwabAPIError
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,8 @@ _APPROVAL_PROGRESS_INTERVAL = 5.0
 # A looping or misbehaving model must not be able to flood the reviewer.
 MAX_PENDING_APPROVALS = 3
 _APPROVAL_WAIT_MESSAGE = "Waiting for reviewer approval…"
+# An approval channel that stalls must not hold a finished write's result.
+_OUTCOME_REPORT_TIMEOUT_SECONDS = 10.0
 
 
 def _is_context_annotation(annotation: Any) -> bool:
@@ -174,6 +177,37 @@ async def run_approval(context: SchwabContext, request: ApprovalRequest) -> Appr
     return decision
 
 
+def describe_write_error(exc: BaseException) -> str:
+    """One line naming why an approved write failed, for the reviewer.
+
+    Schwab errors show the HTTP status and response body, not the request URL,
+    which carries the full account hash.
+    """
+    if isinstance(exc, SchwabAPIError):
+        return f"Schwab API error (HTTP {exc.status_code}): {exc.body}"
+    return f"{type(exc).__name__}: {exc}"
+
+
+async def report_outcome(context: SchwabContext, request: ApprovalRequest, outcome: str, *, succeeded: bool) -> None:
+    """Tell the reviewer what an approved write did, best effort.
+
+    The write has already happened, so a broken or stalled approval channel
+    is logged and never changes the tool's result or masks its error.
+    """
+    try:
+        await asyncio.wait_for(
+            context.approvals.report_outcome(request, outcome, succeeded=succeeded),
+            timeout=_OUTCOME_REPORT_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to report the outcome of approval %s for tool '%s' to the reviewer",
+            request.id,
+            request.tool_name,
+            exc_info=True,
+        )
+
+
 def _wrap_with_approval(func: ToolFn) -> ToolFn:
     signature, ctx_params = _resolve_context_parameters(func)
     if not ctx_params:
@@ -226,9 +260,14 @@ def _wrap_with_approval(func: ToolFn) -> ToolFn:
             request.request_id,
         )
         if decision is ApprovalDecision.APPROVED:
-            result = func(*bound.args, **bound.kwargs)
-            if inspect.isawaitable(result):
-                return await result
+            try:
+                result = func(*bound.args, **bound.kwargs)
+                if inspect.isawaitable(result):
+                    result = await result
+            except Exception as exc:
+                await report_outcome(context, request, f"failed: {describe_write_error(exc)}", succeeded=False)
+                raise
+            await report_outcome(context, request, "completed", succeeded=True)
             return result
 
         message = (
@@ -415,4 +454,10 @@ def register_tool(
     _forbid_unknown_arguments(server, func.__name__)
 
 
-__all__ = ["register_tool", "run_approval", "verify_closed_arguments"]
+__all__ = [
+    "describe_write_error",
+    "register_tool",
+    "report_outcome",
+    "run_approval",
+    "verify_closed_arguments",
+]
