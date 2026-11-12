@@ -146,6 +146,9 @@ def assert_approval_request(
     assert request.arguments == {
         "original_tool": "preview_equity_order",
         "order_summary": "SINGLE BUY 3 MSFT EQUITY MARKET session=NORMAL duration=DAY",
+        "schwab_preview": (
+            "est. value not provided; commission and fees not provided; buying power after not provided; no warnings"
+        ),
         "preview_id": preview_id,
         "account_hash": ACCOUNT_HASH,
     }

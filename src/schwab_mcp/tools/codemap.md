@@ -76,7 +76,14 @@ compact defaults with `verbose=True` escape hatches where response size matters.
     closed so unknown keys are refused at the MCP boundary. `place_previewed_order()` consumes only PLACE_ORDER entries,
     while `preview_replacement_order()` caches a typed single-leg replacement
     bound to an existing order and `replace_previewed_order()` consumes only
-    REPLACE_ORDER entries. Both custom executors request approval and return
+    REPLACE_ORDER entries. `cancel_order()` and `replace_previewed_order()` fetch
+    the target order before approval and put it in the prompt
+    (`_fetch_current_order()` / `_current_order_summary()`), refusing a target
+    that cannot be read, has no legs, has finished, or is not cancelable /
+    editable. Previews refuse a Schwab-rejected preview and store
+    `_preview_line()` (est. value, commission and fees, buying power,
+    warnings), which the place and replace prompts show as `schwab_preview`.
+    Both custom executors request approval and return
     compact post-write order status. Every approval summary is rendered by
     `_spec_summary()` from the built spec (all legs, nested child orders,
     prices, session, duration) before any API call; values it cannot show

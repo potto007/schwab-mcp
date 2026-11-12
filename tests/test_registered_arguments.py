@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from conftest import run
+from conftest import run, working_order
 from mcp.server.mcpserver import Context as MCPContext, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from schwab.client import AsyncClient
@@ -48,7 +48,11 @@ class RecordingClient:
     def __getattr__(self, name: str) -> Callable[..., Awaitable[Any]]:
         async def method(*args: Any, **kwargs: Any) -> Any:
             self.calls.append((name, kwargs))
-            return {"orderId": "1", "status": "CANCELED"} if name == "get_order" else {}
+            if name != "get_order":
+                return {}
+            if any(called == "cancel_order" for called, _ in self.calls):
+                return {"orderId": "1", "status": "CANCELED"}
+            return working_order("1")
 
         return method
 
@@ -212,4 +216,4 @@ def test_write_tool_refuses_unknown_argument_before_approval(harness: Harness) -
 
     assert not result.is_error
     assert len(harness.approvals.requests) == 1
-    assert [name for name, _ in harness.client.calls] == ["cancel_order", "get_order"]
+    assert [name for name, _ in harness.client.calls] == ["get_order", "cancel_order", "get_order"]

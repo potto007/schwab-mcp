@@ -1117,6 +1117,185 @@ def _preview_action(account_hash: str, preview_id: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Current order (cancel / replace prompts) and Schwab preview line (place /
+# replace prompts): what the approver needs without opening Schwab.
+# ---------------------------------------------------------------------------
+
+# Execution-relevant fields of an order as Schwab reports it, in display
+# order. Bookkeeping (leg ids, CUSIPs, activity history, timestamps) is left
+# out; everything kept is rendered by _spec_summary.
+_CURRENT_ORDER_NODE_FIELDS = (
+    "orderStrategyType",
+    "orderType",
+    "complexOrderStrategyType",
+    "price",
+    "stopPrice",
+    "stopPriceOffset",
+    "stopPriceLinkType",
+    "stopPriceLinkBasis",
+    "stopType",
+    "priceLinkBasis",
+    "priceLinkType",
+    "priceOffset",
+    "activationPrice",
+    "specialInstruction",
+    "session",
+    "duration",
+    "status",
+    "filledQuantity",
+    "remainingQuantity",
+)
+_CURRENT_ORDER_LEG_FIELDS = ("instruction", "quantity", "positionEffect")
+_FINISHED_ORDER_STATUSES = frozenset({"FILLED", "CANCELED", "REJECTED", "EXPIRED", "REPLACED"})
+
+
+def _current_order_node(order: Any, *, top: bool) -> dict[str, Any]:
+    if not isinstance(order, dict):
+        raise ValueError(f"Order node cannot be shown in the approval summary: {order!r}")
+    node: dict[str, Any] = {}
+    for field in _CURRENT_ORDER_NODE_FIELDS:
+        if field in order and not (field == "complexOrderStrategyType" and order[field] == "NONE"):
+            node[field] = order[field]
+    if not top and "orderId" in order:
+        node["orderId"] = order["orderId"]
+    legs = []
+    for leg in order.get("orderLegCollection") or []:
+        if not isinstance(leg, dict) or not isinstance(leg.get("instrument"), dict):
+            raise ValueError(f"Order leg cannot be shown in the approval summary: {leg!r}")
+        reduced = {field: leg[field] for field in _CURRENT_ORDER_LEG_FIELDS if field in leg}
+        reduced["instrument"] = {
+            "symbol": leg["instrument"].get("symbol"),
+            "assetType": leg["instrument"].get("assetType"),
+        }
+        legs.append(reduced)
+    if legs:
+        node["orderLegCollection"] = legs
+    children = [_current_order_node(child, top=False) for child in order.get("childOrderStrategies") or []]
+    if children:
+        node["childOrderStrategies"] = children
+    return node
+
+
+def _has_legs(node: dict[str, Any]) -> bool:
+    return bool(node.get("orderLegCollection")) or any(
+        _has_legs(child) for child in node.get("childOrderStrategies", [])
+    )
+
+
+def _current_order_summary(order: dict[str, Any]) -> str:
+    """Render an existing order, as Schwab reports it, for an approval prompt.
+
+    An order with no legs anywhere cannot be identified by the approver, so
+    it is refused rather than shown as a bare status line.
+    """
+    node = _current_order_node(order, top=True)
+    if not _has_legs(node):
+        raise ValueError("Order has no legs to show in the approval prompt; refusing to request approval.")
+    return _spec_summary(node)
+
+
+async def _fetch_current_order(ctx: SchwabContext, account_hash: str, order_id: str, action: str) -> str:
+    """Fetch the order a cancel or replace targets and render it for the prompt.
+
+    Refuses, before any approval request, an order that cannot be read, has
+    finished, or that Schwab reports as not cancelable / not editable. A fetch
+    error propagates, so an unknown target never reaches the approver.
+    """
+    order = await call(ctx.orders.get_order, order_id=order_id, account_hash=account_hash)
+    if not isinstance(order, dict) or not order:
+        raise ValueError(f"Order {order_id} could not be read from Schwab; refusing to {action} it.")
+    status = order.get("status")
+    if status in _FINISHED_ORDER_STATUSES:
+        done = {"cancel": "canceled", "replace": "replaced"}.get(action, action)
+        raise ValueError(f"Order {order_id} is {status}; it can no longer be {done}.")
+    flag = "cancelable" if action == "cancel" else "editable"
+    if order.get(flag) is False:
+        raise ValueError(f"Schwab reports order {order_id} as not {flag}; refusing to {action} it.")
+    return _current_order_summary(order)
+
+
+_PREVIEW_MESSAGE_LIMIT = 160
+
+
+def _money(value: Any) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    sign = "-" if value < 0 else ""
+    return f"{sign}${abs(value):,.2f}"
+
+
+def _preview_messages(validation: Any, kinds: tuple[str, ...]) -> list[str]:
+    messages: list[str] = []
+    if not isinstance(validation, dict):
+        return messages
+    for kind in kinds:
+        entries = validation.get(kind)
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            raw = entry.get("message") or entry.get("activityMessage") or entry.get("validationRuleName") or kind
+            text = " ".join("".join(c if c.isprintable() else " " for c in str(raw)).split())
+            if len(text) > _PREVIEW_MESSAGE_LIMIT:
+                text = text[: _PREVIEW_MESSAGE_LIMIT - 1] + "\u2026"
+            messages.append(text)
+    return messages
+
+
+def _refuse_rejected_preview(preview: Any) -> None:
+    """Raise if Schwab's preview rejected the order, so it is never cached."""
+    if not isinstance(preview, dict):
+        return
+    rejects = _preview_messages(preview.get("orderValidationResult"), ("rejects",))
+    if rejects:
+        raise ValueError("Schwab's preview rejected this order: " + " | ".join(rejects))
+
+
+def _preview_fees(preview: dict[str, Any], balance: dict[str, Any]) -> str | None:
+    values: list[float] = []
+    fees = preview.get("commissionAndFee")
+    if isinstance(fees, dict):
+        for group, legs_key, values_key in (
+            ("commission", "commissionLegs", "commissionValues"),
+            ("fee", "feeLegs", "feeValues"),
+        ):
+            section = fees.get(group)
+            legs = section.get(legs_key) if isinstance(section, dict) else None
+            for leg in legs if isinstance(legs, list) else []:
+                items = leg.get(values_key) if isinstance(leg, dict) else None
+                for item in items if isinstance(items, list) else []:
+                    value = item.get("value") if isinstance(item, dict) else None
+                    if isinstance(value, (int, float)) and _money(value) is not None:
+                        values.append(float(value))
+    if values:
+        return _money(sum(values))
+    return _money(balance.get("projectedCommission"))
+
+
+def _preview_line(preview: Any) -> str:
+    """Render Schwab's preview result for an approval prompt.
+
+    Shows the estimated order value, commission and fees, projected buying
+    power and any warning, alert or review messages. Fields Schwab did not
+    return render as "not provided".
+    """
+    payload: dict[str, Any] = preview if isinstance(preview, dict) else {}
+    strategy_raw = payload.get("orderStrategy")
+    strategy: dict[str, Any] = strategy_raw if isinstance(strategy_raw, dict) else {}
+    balance_raw = strategy.get("orderBalance")
+    balance: dict[str, Any] = balance_raw if isinstance(balance_raw, dict) else {}
+    value = _money(balance.get("orderValue")) or _money(strategy.get("orderValue"))
+    fees = _preview_fees(payload, balance)
+    buying_power = _money(balance.get("projectedBuyingPower"))
+    warnings = _preview_messages(payload.get("orderValidationResult"), ("warns", "alerts", "reviews"))
+    missing = "not provided"
+    return (
+        f"est. value {value or missing}; commission and fees {fees or missing}; "
+        f"buying power after {buying_power or missing}; "
+        + ("warnings: " + " | ".join(warnings) if warnings else "no warnings")
+    )
+
+
 async def _finalize_preview(
     ctx: SchwabContext,
     account_hash: str,
@@ -1134,12 +1313,14 @@ async def _finalize_preview(
     summary = _spec_summary(order_spec)
     await _require_spec_supported_asset_types(ctx.tools, order_spec)
     preview = await call(ctx.orders.preview_order, account_hash=account_hash, order_spec=order_spec)
+    _refuse_rejected_preview(preview)
     preview_id = ctx.previews.put(
         account_hash,
         order_spec,
         tool_name,
         summary,
         operation=PreviewOperation.PLACE_ORDER,
+        preview_line=_preview_line(preview),
     )
     return {
         "preview_id": preview_id,
@@ -1268,13 +1449,18 @@ async def cancel_order(
     """Cancels a pending order. Cannot cancel executed/terminal orders. Params: account_hash, order_id. Returns updated order details (compact/pruned, same shape as get_order) after cancellation; falls back to a minimal {orderId, status, note} payload if the post-cancel status fetch fails or returns no data. *Write operation.*"""
     validate_identifier(account_hash, "account_hash")
     validate_identifier(order_id, "order_id")
+    current_order = await _fetch_current_order(ctx, account_hash, order_id, "cancel")
 
     request = ApprovalRequest(
         id=str(uuid.uuid4()),
         tool_name="cancel_order",
         request_id=ctx.request_id,
         client_id=ctx.client_id,
-        arguments={"account_hash": repr(account_hash), "order_id": repr(order_id)},
+        arguments={
+            "account_hash": repr(account_hash),
+            "order_id": repr(order_id),
+            "current_order": current_order,
+        },
     )
     decision = await run_approval(ctx, request)
     if decision is not ApprovalDecision.APPROVED:
@@ -1674,6 +1860,7 @@ async def preview_replacement_order(
     summary = _spec_summary(order_spec)
     await _require_spec_supported_asset_types(ctx.tools, order_spec)
     preview = await call(ctx.orders.preview_order, account_hash=account_hash, order_spec=order_spec)
+    _refuse_rejected_preview(preview)
     preview_id = ctx.previews.put(
         account_hash,
         order_spec,
@@ -1681,6 +1868,7 @@ async def preview_replacement_order(
         summary,
         operation=PreviewOperation.REPLACE_ORDER,
         target_order_id=normalized_order_id,
+        preview_line=_preview_line(preview),
     )
     return {
         "preview_id": preview_id,
@@ -1715,6 +1903,7 @@ async def place_previewed_order(
         arguments={
             "original_tool": entry.tool_name,
             "order_summary": entry.summary,
+            "schwab_preview": entry.preview_line or "not available",
             "preview_id": preview_id,
             "account_hash": account_hash,
         },
@@ -1752,11 +1941,15 @@ async def replace_previewed_order(
     Approval is requested only after the account, operation, and target order
     binding have been validated.
     """
-    ensure_approval_capacity(ctx, "replace_previewed_order")
-    entry = ctx.previews.pop(preview_id, account_hash, operation=PreviewOperation.REPLACE_ORDER)
-    target_order_id = entry.target_order_id.strip() if entry.target_order_id is not None else None
+    peeked = ctx.previews.peek(preview_id, account_hash, operation=PreviewOperation.REPLACE_ORDER)
+    target_order_id = peeked.target_order_id.strip() if peeked.target_order_id is not None else None
     if not target_order_id:
         raise ValueError("Replacement preview is missing its target order id.")
+    current_order = await _fetch_current_order(ctx, account_hash, target_order_id, "replace")
+    # No await from here to run_approval's own cap check: checking the cap,
+    # consuming the preview and requesting approval happen together.
+    ensure_approval_capacity(ctx, "replace_previewed_order")
+    entry = ctx.previews.pop(preview_id, account_hash, operation=PreviewOperation.REPLACE_ORDER)
 
     request = ApprovalRequest(
         id=str(uuid.uuid4()),
@@ -1765,7 +1958,9 @@ async def replace_previewed_order(
         client_id=ctx.client_id,
         arguments={
             "original_tool": entry.tool_name,
+            "current_order": current_order,
             "order_summary": entry.summary,
+            "schwab_preview": entry.preview_line or "not available",
             "preview_id": preview_id,
             "account_hash": account_hash,
             "target_order_id": target_order_id,
