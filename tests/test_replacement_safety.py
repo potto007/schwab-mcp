@@ -67,7 +67,7 @@ def replacement_description() -> orders._OrderDescInput:
     return cast(
         orders._OrderDescInput,
         {
-            "symbol": "SPY 251219C500",
+            "symbol": "SPY   251219C00500000",
             "quantity": 1,
             "instruction": "BUY_TO_OPEN",
             "order_type": "MARKET",
@@ -92,7 +92,7 @@ def test_replacement_uses_immutable_preview_and_exact_bound_target(monkeypatch: 
     ctx.schwab.approval_manager = approval_manager
     monkeypatch.setattr(orders, "call", call_fake_client)
     replacement: dict[str, Any] = {
-        "symbol": "SPY 251219C500",
+        "symbol": "SPY   251219C00500000",
         "quantity": 2,
         "instruction": "BUY_TO_OPEN",
         "order_type": "LIMIT",
@@ -127,7 +127,7 @@ def test_replacement_uses_immutable_preview_and_exact_bound_target(monkeypatch: 
     assert replacement_payload["order_spec"]["orderLegCollection"][0]["quantity"] == 2
     assert approval_manager.requests[0].arguments["target_order_id"] == "padded-order-9"
     assert approval_manager.requests[0].arguments["order_summary"] == (
-        "SINGLE BUY_TO_OPEN 2 SPY 251219C500 OPTION LIMIT @ $1.23 session=AM duration=DAY"
+        "SINGLE BUY_TO_OPEN 2 SPY   251219C00500000 OPTION LIMIT @ $1.23 session=AM duration=DAY"
     )
 
 
@@ -136,7 +136,7 @@ def test_replacement_uses_immutable_preview_and_exact_bound_target(monkeypatch: 
     [
         (
             {
-                "symbol": "SPY 251219C500",
+                "symbol": "SPY   251219C00500000",
                 "quantity": 1,
                 "instruction": "BUY_TO_OPEN",
                 "order_type": "LIMIT",
@@ -145,7 +145,7 @@ def test_replacement_uses_immutable_preview_and_exact_bound_target(monkeypatch: 
                 "session": "PM",
                 "duration": "GTC",
             },
-            "SINGLE BUY_TO_OPEN 1 SPY 251219C500 OPTION LIMIT @ $0.1234 session=PM duration=GOOD_TILL_CANCEL",
+            "SINGLE BUY_TO_OPEN 1 SPY   251219C00500000 OPTION LIMIT @ $0.1234 session=PM duration=GOOD_TILL_CANCEL",
         ),
         (
             {
@@ -202,7 +202,7 @@ def test_wrong_account_does_not_consume_replacement_preview(monkeypatch: pytest.
             cast(
                 orders._OrderDescInput,
                 {
-                    "symbol": "SPY 251219C500",
+                    "symbol": "SPY   251219C00500000",
                     "quantity": 1,
                     "instruction": "BUY_TO_OPEN",
                     "order_type": "MARKET",
@@ -251,7 +251,7 @@ def test_wrong_operation_preserves_placement_preview_for_place(monkeypatch: pyte
         orders.preview_option_order(
             ctx,
             "account",
-            "SPY 251219C500",
+            "SPY   251219C00500000",
             1,
             "BUY_TO_OPEN",
             "MARKET",
@@ -376,7 +376,7 @@ def test_replacement_rejects_url_structural_target_ids(unsafe_id: str) -> None:
                 cast(
                     orders._OrderDescInput,
                     {
-                        "symbol": "SPY 251219C500",
+                        "symbol": "SPY   251219C00500000",
                         "quantity": 1,
                         "instruction": "BUY_TO_OPEN",
                         "order_type": "MARKET",

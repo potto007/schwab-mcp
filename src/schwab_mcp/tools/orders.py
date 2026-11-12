@@ -57,10 +57,17 @@ from schwab_mcp.tools.order_helpers import (
 from schwab_mcp.tools.utils import JSONType, ResponseHandler, SchwabAPIError, call, validate_identifier
 
 logger = logging.getLogger(__name__)
-# Symbols reach the approval prompt and Schwab's order payload. Allow the
-# characters real Schwab symbols use: equities (BRK.B, BRK/B, BF-B), indexes
-# ($SPX), futures (/ES) and space-padded option symbols.
-_SAFE_SYMBOL = re.compile(r"[A-Za-z0-9 .$/-]{1,32}", re.ASCII)
+# Symbols reach the approval prompt and Schwab's order payload, so each asset
+# type has one strict grammar and no whitespace is tolerated except the option
+# root padding. Equities: BRK.B, BRK/B, BF-B, indexes ($SPX), futures (/ES).
+_EQUITY_SYMBOL = re.compile(r"[A-Za-z0-9.$/-]{1,15}", re.ASCII)
+# Options: Schwab's 21 characters. Root of 1-6 [A-Z0-9.] right-padded with
+# spaces to 6, then YYMMDD, C or P, and 8 strike digits (e.g. SPY   251219C00500000).
+_OPTION_SYMBOL_LENGTH = 21
+_OPTION_ROOT_WIDTH = 6
+_OPTION_ROOT = re.compile(r"[A-Z0-9.]{1,6} *", re.ASCII)
+_OPTION_TAIL = re.compile(r"[0-9]{6}[CP][0-9]{8}", re.ASCII)
+_OPTION_SYMBOL_EXAMPLE = "SPY   251219C00500000"
 
 _COMPACT_ORDER_TOP_FIELDS = frozenset(
     {
@@ -167,10 +174,26 @@ _COMBO_UNPRICED_TYPES: frozenset[str] = frozenset({"NET_ZERO", "MARKET"})
 _VALID_COMPLEX_STRATEGIES: frozenset[str] = frozenset(t.name for t in ComplexOrderStrategyType)
 
 
-def _validate_symbol(symbol: Any, field: str = "symbol") -> str:
-    """Require a symbol made only of characters real Schwab symbols use."""
-    if not isinstance(symbol, str) or _SAFE_SYMBOL.fullmatch(symbol) is None or not symbol.strip():
-        raise ValueError(f"{field} must be 1 to 32 ASCII letters, digits, spaces, or . $ / -, got {symbol!r}")
+def _validate_equity_symbol(symbol: Any, field: str = "symbol") -> str:
+    """Require an equity symbol: 1 to 15 of A-Z a-z 0-9 . $ / -, no whitespace."""
+    if not isinstance(symbol, str) or _EQUITY_SYMBOL.fullmatch(symbol) is None:
+        raise ValueError(f"{field} must be 1 to 15 ASCII letters, digits, or . $ / - with no spaces, got {symbol!r}")
+    return symbol
+
+
+def _validate_option_symbol(symbol: Any, field: str = "symbol") -> str:
+    """Require Schwab's 21-character option symbol (root padded to 6, YYMMDD, C/P, 8 strike digits)."""
+    if (
+        not isinstance(symbol, str)
+        or len(symbol) != _OPTION_SYMBOL_LENGTH
+        or _OPTION_ROOT.fullmatch(symbol[:_OPTION_ROOT_WIDTH]) is None
+        or _OPTION_TAIL.fullmatch(symbol[_OPTION_ROOT_WIDTH:]) is None
+    ):
+        raise ValueError(
+            f"{field} must be a 21-character option symbol: root of 1 to 6 uppercase letters, digits, or . padded "
+            f"with spaces to 6, then YYMMDD, C or P, and 8 strike digits (e.g. {_OPTION_SYMBOL_EXAMPLE!r}), "
+            f"got {symbol!r}"
+        )
     return symbol
 
 
@@ -382,7 +405,7 @@ def _build_equity_order_spec(
     stop_price: float | None = None,
 ):
     """Internal helper to build the core equity order spec builder based on parameters."""
-    _validate_symbol(symbol)
+    _validate_equity_symbol(symbol)
     _validate_quantity(quantity)
     instruction = instruction.upper() if isinstance(instruction, str) else repr(instruction)
     order_type = order_type.upper()
@@ -448,7 +471,7 @@ def _build_trailing_stop_order_spec(
     trail_offset: float,
     trail_type: str = "VALUE",
 ):
-    _validate_symbol(symbol)
+    _validate_equity_symbol(symbol)
     _validate_quantity(quantity)
     instruction = instruction.upper() if isinstance(instruction, str) else repr(instruction)
     trail_type = trail_type.upper()
@@ -498,7 +521,7 @@ def _build_option_order_spec(
     price: float | None = None,
 ):
     """Internal helper to build the core option order spec builder based on parameters."""
-    _validate_symbol(symbol)
+    _validate_option_symbol(symbol)
     _validate_quantity(quantity)
     instruction = instruction.upper() if isinstance(instruction, str) else repr(instruction)
     order_type = order_type.upper()
@@ -1105,7 +1128,7 @@ def _validate_combo_leg(leg: Any, index: int) -> tuple[str, str, int]:
         keys = sorted(leg) if isinstance(leg, dict) else type(leg).__name__
         raise ValueError(f"legs[{index}] must have exactly the keys instruction, quantity, symbol; got {keys}")
     instruction = _normalize_choice(leg["instruction"], _OPTION_INSTRUCTIONS, f"legs[{index}].instruction")
-    symbol = _validate_symbol(leg["symbol"], f"legs[{index}].symbol")
+    symbol = _validate_option_symbol(leg["symbol"], f"legs[{index}].symbol")
     quantity = _validate_quantity(leg["quantity"], f"legs[{index}].quantity")
     return instruction, symbol, quantity
 
@@ -1310,7 +1333,7 @@ async def create_option_symbol(
     contract_type: Annotated[str, "Contract type: 'C' or 'CALL' for calls, 'P' or 'PUT' for puts"],
     strike_price: Annotated[str, "Strike price as a string (e.g., '400', '150.5')"],
 ) -> str:
-    """Creates formatted option symbol string from components (e.g., 'SPY 230616C400').
+    """Creates formatted option symbol string from components (e.g., 'SPY   230616C00400000').
     Params: underlying_symbol, expiration_date (YYMMDD), contract_type (C/CALL or P/PUT), strike_price (string).
     Does not validate market existence. Use get_option_chain() to find valid options.
     """
@@ -1411,7 +1434,7 @@ async def preview_option_order(
     account_hash: Annotated[str, "Account hash for the Schwab account"],
     symbol: Annotated[
         str,
-        "Option symbol in Schwab's space-delimited format (e.g., 'SPY 230616C400'). Use create_option_symbol() to build one.",
+        "Option symbol in Schwab's 21-character format: root padded to 6, YYMMDD, C/P, 8 strike digits (e.g., 'SPY   230616C00400000'). Use create_option_symbol() to build one.",
     ],
     quantity: Annotated[int, "Number of contracts to trade"],
     instruction: Annotated[str, "BUY_TO_OPEN, SELL_TO_OPEN, BUY_TO_CLOSE, or SELL_TO_CLOSE"],
