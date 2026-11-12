@@ -90,6 +90,20 @@ def _write_private_atomic(path: str, write: Callable[[IO[str]], None]) -> None:
             os.close(dir_fd)
 
 
+def order_ledger_path(app_name: str, filename: str = "daily-orders.json") -> str:
+    """Path of the daily order ledger, owner-only like the token."""
+    return _private_data_path(app_name, filename)
+
+
+def write_private_text(path: str, text: str) -> None:
+    """Write ``text`` to ``path`` owner-only (0600) and atomically."""
+
+    def write(f: IO[str]) -> None:
+        f.write(text)
+
+    _write_private_atomic(path, write)
+
+
 def token_path(app_name: str, filename: str = "token.yaml") -> str:
     """Get the path to the token file.
 

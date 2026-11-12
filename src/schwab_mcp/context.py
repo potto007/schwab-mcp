@@ -9,6 +9,7 @@ from mcp.server.mcpserver import Context as MCPContext
 from schwab.client import AsyncClient
 
 from schwab_mcp.approvals import ApprovalManager
+from schwab_mcp.limits import OrderLedger, TradingLimits
 from schwab_mcp.previews import PreviewStore
 
 if TYPE_CHECKING:
@@ -41,6 +42,10 @@ class SchwabServerContext:
     quotes: QuotesClient = field(init=False)
     transactions: TransactionsClient = field(init=False)
     preview_store: PreviewStore = field(default_factory=PreviewStore)
+    trading_limits: TradingLimits | None = None
+    """Caps every order write must pass; write tools refuse without them."""
+    order_ledger: OrderLedger | None = None
+    """Process-scoped daily order count shared by every session."""
     pending_approvals: int = field(default=0, init=False)
     """Approval requests currently waiting on the reviewer (see run_approval)."""
 

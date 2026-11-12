@@ -31,6 +31,7 @@ EXPECTED_ORDER_SPEC: dict[str, Any] = {
 }
 
 PREVIEW_PAYLOAD = {
+    "orderStrategy": {"orderBalance": {"orderValue": 1234.56}},
     "orderValidationResult": {"type": "ACCEPTED"},
     "projectedOrder": {"orderType": "MARKET", "status": "WORKING"},
 }
@@ -146,6 +147,9 @@ def assert_approval_request(
     assert request.arguments == {
         "original_tool": "preview_equity_order",
         "order_summary": "SINGLE BUY 3 MSFT EQUITY MARKET session=NORMAL duration=DAY",
+        "schwab_preview": (
+            "est. value $1,234.56; commission and fees not provided; buying power after not provided; no warnings"
+        ),
         "preview_id": preview_id,
         "account_hash": ACCOUNT_HASH,
     }

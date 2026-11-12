@@ -14,6 +14,7 @@ from schwab.client import AsyncClient
 
 from schwab_mcp.approvals import ApprovalManager
 from schwab_mcp.context import SchwabServerContext
+from schwab_mcp.limits import OrderLedger, TradingLimits
 from schwab_mcp.resources import register_resources
 from schwab_mcp.tools import register_tools
 from schwab_mcp.tools._registration import verify_closed_arguments
@@ -32,6 +33,8 @@ def is_loopback_host(host: str | None) -> bool:
 def _client_lifespan(
     client: AsyncClient,
     approval_manager: ApprovalManager,
+    trading_limits: TradingLimits | None = None,
+    order_ledger: OrderLedger | None = None,
 ) -> Callable[[MCPServer], AbstractAsyncContextManager[SchwabServerContext]]:
     """Create an MCPServer lifespan context that exposes the Schwab async client."""
 
@@ -42,7 +45,12 @@ def _client_lifespan(
         # kills every subsequent session ("Cannot send a request, as the client
         # has been closed"). Leave session teardown to process exit.
         await approval_manager.start()
-        context = SchwabServerContext(client=client, approval_manager=approval_manager)
+        context = SchwabServerContext(
+            client=client,
+            approval_manager=approval_manager,
+            trading_limits=trading_limits,
+            order_ledger=order_ledger,
+        )
         try:
             yield context
         finally:
@@ -66,7 +74,11 @@ class SchwabMCPServer:
         allow_write: bool,
         enable_technical_tools: bool = True,
         use_json: bool = False,
+        trading_limits: TradingLimits | None = None,
+        order_ledger: OrderLedger | None = None,
     ) -> None:
+        if allow_write and (trading_limits is None or order_ledger is None):
+            raise ValueError("Write tools require trading limits and a daily order ledger.")
         if not use_json:
             try:
                 from toon import encode as toon_encode
@@ -92,7 +104,7 @@ class SchwabMCPServer:
 
         self._server = MCPServer(
             name=name,
-            lifespan=_client_lifespan(client, approval_manager),
+            lifespan=_client_lifespan(client, approval_manager, trading_limits, order_ledger),
         )
         register_tools(
             self._server,

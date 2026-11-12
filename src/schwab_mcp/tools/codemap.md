@@ -20,7 +20,12 @@ compact defaults with `verbose=True` escape hatches where response size matters.
   `SchwabServerContext.pending_approvals`, and refuses more with
   `PermissionError` before the backend is contacted. The previewed-order
   executors call `ensure_approval_capacity()` before consuming the preview,
-  so a refusal leaves it usable.
+  so a refusal leaves it usable. After an approved write, `report_outcome()`
+  sends the reviewer one outcome line through the approval manager (bounded
+  by `_OUTCOME_REPORT_TIMEOUT_SECONDS`; failures are logged, never raised).
+  Wrapped write tools report `completed` or `failed: <error>`;
+  `describe_write_error()` shows a Schwab error's status and body, not its
+  URL.
 - `_protocols.py` defines Protocol facades for each Schwab client namespace
   (`accounts`, `orders`, `quotes`, `options`, `price_history`, etc.). These keep
   `SchwabContext` access type-checkable without coupling tool code to concrete
@@ -76,14 +81,31 @@ compact defaults with `verbose=True` escape hatches where response size matters.
     closed so unknown keys are refused at the MCP boundary. `place_previewed_order()` consumes only PLACE_ORDER entries,
     while `preview_replacement_order()` caches a typed single-leg replacement
     bound to an existing order and `replace_previewed_order()` consumes only
-    REPLACE_ORDER entries. Both custom executors request approval and return
+    REPLACE_ORDER entries. `cancel_order()` and `replace_previewed_order()` fetch
+    the target order before approval and put it in the prompt
+    (`_fetch_current_order()` / `_current_order_summary()`), refusing a target
+    that cannot be read, has no legs, has finished, or is not cancelable /
+    editable. Previews refuse a Schwab-rejected preview and store
+    `_preview_line()` (est. value, commission and fees, buying power,
+    warnings), which the place and replace prompts show as `schwab_preview`,
+    plus `_preview_order_value()` for the limits check. Before approval both
+    executors require configured limits (`_trading_guard()`), run
+    `limits.check_order()` on the peeked preview, and reserve a daily slot,
+    all before the preview is consumed, so a refusal leaves it usable; the
+    slot is committed (`_commit_slot()`) right before the write and released
+    on denial or expiry.
+    Both custom executors request approval and return
     compact post-write order status. Every approval summary is rendered by
     `_spec_summary()` from the built spec (all legs, nested child orders,
     prices, session, duration) before any API call; values it cannot show
     faithfully fail the preview. Replacement target IDs reject URL-unsafe
     values. A failed
     status fetch, including an HTTP transport failure, preserves the successful
-    write response as a fallback. `cancel_order()` validates both identifiers
+    write response as a fallback. Place, replace and cancel run the write
+    through `_run_order_write()`, which reports the order id and Schwab status
+    (with `statusDescription`, now kept in pruned orders) or the write error to
+    the reviewer, with the account hash shortened to its last four
+    characters. `cancel_order()` validates both identifiers
     before custom approval and the cancel request, and preserves its fallback
     when status lookup fails with an API, parsing, or transport error.
 

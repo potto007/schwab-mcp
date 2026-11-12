@@ -685,3 +685,27 @@ def test_receive_loop_logs_misconfigured_daemon_mode(
         await_result(scenario())
 
     assert any("MODE=json-rpc" in record.getMessage() for record in caplog.records)
+
+
+def test_report_outcome_sends_an_outcome_notice(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager, sent = _make_manager(monkeypatch)
+
+    await_result(
+        manager.report_outcome(_request(), "cancel submitted for order 1: order 1, status CANCELED", succeeded=True)
+    )
+
+    assert sent == [
+        "✅ schwab-mcp approval appr-1 for 'cancel_order' outcome: "
+        "cancel submitted for order 1: order 1, status CANCELED"
+    ]
+
+
+def test_report_outcome_marks_failures_and_keeps_one_short_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager, sent = _make_manager(monkeypatch)
+
+    await_result(manager.report_outcome(_request(), "cancel failed: x\ny" + "z" * 3000, succeeded=False))
+
+    [body] = sent
+    assert body.startswith("⚠️ schwab-mcp approval appr-1 for 'cancel_order' outcome: cancel failed: x y")
+    assert "\n" not in body
+    assert len(body) <= signal_mod._BODY_LIMIT

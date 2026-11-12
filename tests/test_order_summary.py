@@ -33,7 +33,7 @@ class SummaryClient:
 
     async def preview_order(self, *args: Any, **kwargs: Any) -> Any:
         self.calls.append("preview_order")
-        return {}
+        return {"orderStrategy": {"orderValue": 100.0}}
 
 
 @pytest.fixture
@@ -267,7 +267,12 @@ def test_approval_request_carries_summary_of_placed_spec(monkeypatch: pytest.Mon
     ctx = make_ctx(SummaryClient())
     spec = orders._prepare_oco_order(_OCO_FIRST, _OCO_SECOND)
     preview_id = ctx.previews.put(
-        ACCOUNT, spec, "preview_oco_order", orders._spec_summary(spec), operation=PreviewOperation.PLACE_ORDER
+        ACCOUNT,
+        spec,
+        "preview_oco_order",
+        orders._spec_summary(spec),
+        operation=PreviewOperation.PLACE_ORDER,
+        order_value=100.0,
     )
     seen: dict[str, Any] = {}
 

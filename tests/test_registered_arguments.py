@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from conftest import run
+from conftest import TEST_TRADING_LIMITS, run, working_order
 from mcp.server.mcpserver import Context as MCPContext, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase
@@ -25,6 +25,7 @@ from schwab.client import AsyncClient
 from schwab_mcp import tools as tools_module
 from schwab_mcp.approvals import ApprovalDecision, ApprovalManager, ApprovalRequest
 from schwab_mcp.context import SchwabServerContext
+from schwab_mcp.limits import OrderLedger
 from schwab_mcp.server import SchwabMCPServer
 from schwab_mcp.tools import _registration, orders
 
@@ -53,7 +54,11 @@ class RecordingClient:
     def __getattr__(self, name: str) -> Callable[..., Awaitable[Any]]:
         async def method(*args: Any, **kwargs: Any) -> Any:
             self.calls.append((name, kwargs))
-            return {"orderId": "1", "status": "CANCELED"} if name == "get_order" else {}
+            if name != "get_order":
+                return {}
+            if any(called == "cancel_order" for called, _ in self.calls):
+                return {"orderId": "1", "status": "CANCELED"}
+            return working_order("1")
 
         return method
 
@@ -66,7 +71,12 @@ class Harness:
         tools_module.register_tools(
             self.server, cast(AsyncClient, self.client), allow_write=True, enable_technical=True
         )
-        lifespan_context = SchwabServerContext(client=cast(AsyncClient, self.client), approval_manager=self.approvals)
+        lifespan_context = SchwabServerContext(
+            client=cast(AsyncClient, self.client),
+            approval_manager=self.approvals,
+            trading_limits=TEST_TRADING_LIMITS,
+            order_ledger=OrderLedger(None),
+        )
         request_context = SimpleNamespace(
             lifespan_context=lifespan_context, request_id="request-1", meta={"client_id": "client-1"}
         )
@@ -100,6 +110,8 @@ def _production_server(client: Any = None) -> MCPServer:
         allow_write=True,
         enable_technical_tools=True,
         use_json=True,
+        trading_limits=TEST_TRADING_LIMITS,
+        order_ledger=OrderLedger(None),
     )
     return cast(MCPServer, schwab_server._server)
 
@@ -248,7 +260,7 @@ def test_write_tool_refuses_unknown_argument_before_approval(harness: Harness) -
 
     assert not result.is_error
     assert len(harness.approvals.requests) == 1
-    assert [name for name, _ in harness.client.calls] == ["cancel_order", "get_order"]
+    assert [name for name, _ in harness.client.calls] == ["get_order", "cancel_order", "get_order"]
 
 
 _LIMIT = {**_EQUITY, "order_type": "LIMIT", "price": 150.0}

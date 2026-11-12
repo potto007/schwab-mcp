@@ -1045,3 +1045,114 @@ async def test_start_wait_is_bounded(monkeypatch) -> None:
         await asyncio.wait_for(mgr.start(), 3)
 
     assert mgr._runner is None
+
+
+# ---------------------------------------------------------------------------
+# report_outcome(): the reviewer hears what an approved write did (#27)
+# ---------------------------------------------------------------------------
+
+
+async def _approve_once(
+    mgr: DiscordApprovalManager, msg: Any, request: ApprovalRequest, emoji: str = "✅"
+) -> ApprovalDecision:
+    async def react() -> None:
+        await wait_until_pending(mgr, msg)
+        await mgr._handle_reaction_add(make_fake_reaction(msg, emoji), make_fake_user(APPROVER_ID))
+
+    reaction_task = asyncio.create_task(react())
+    decision = await mgr.require(request)
+    await reaction_task
+    return decision
+
+
+def _outcome_manager() -> tuple[DiscordApprovalManager, Any, Any]:
+    mgr = make_manager()
+    mgr._ready.set()
+    channel = make_fake_channel()
+    msg = make_fake_message(channel)
+    msg.reply = AsyncMock()
+    channel.send = AsyncMock(return_value=msg)
+    mgr._channel = channel
+    return mgr, channel, msg
+
+
+@pytest.mark.anyio
+async def test_report_outcome_replies_to_the_approved_prompt() -> None:
+    mgr, channel, msg = _outcome_manager()
+    request = make_request()
+    assert await _approve_once(mgr, msg, request) is ApprovalDecision.APPROVED
+
+    await mgr.report_outcome(request, "placed: order 42, status `WORKING`", succeeded=True)
+
+    msg.reply.assert_awaited_once()
+    kwargs = msg.reply.await_args.kwargs
+    assert kwargs["content"] == (
+        "✅ Outcome of `place_order` (approval approval-1):\n```\nplaced: order 42, status ˋWORKINGˋ\n```"
+    )
+    assert kwargs["mention_author"] is False
+    allowed = kwargs["allowed_mentions"]
+    assert (allowed.everyone, allowed.users, allowed.roles, allowed.replied_user) == (False, False, False, False)
+    # The prompt is the only channel post; the outcome is a reply to it.
+    assert channel.send.await_count == 1
+
+
+@pytest.mark.anyio
+async def test_report_outcome_is_sent_once_per_approval() -> None:
+    mgr, channel, msg = _outcome_manager()
+    request = make_request()
+    await _approve_once(mgr, msg, request)
+
+    await mgr.report_outcome(request, "placed: order 42, status WORKING", succeeded=True)
+    await mgr.report_outcome(request, "placed: order 42, status WORKING", succeeded=True)
+
+    assert msg.reply.await_count == 1
+    # A second report has no prompt to reply to, so it goes to the channel.
+    assert channel.send.await_count == 2
+
+
+@pytest.mark.anyio
+async def test_report_outcome_without_a_prompt_posts_to_the_channel() -> None:
+    mgr, channel, _ = _outcome_manager()
+
+    await mgr.report_outcome(make_request(id="other"), "place failed: boom", succeeded=False)
+
+    kwargs = channel.send.await_args.kwargs
+    assert kwargs["content"] == "⚠️ Outcome of `place_order` (approval other):\n```\nplace failed: boom\n```"
+    allowed = kwargs["allowed_mentions"]
+    assert (allowed.everyone, allowed.users, allowed.roles) == (False, False, False)
+
+
+@pytest.mark.anyio
+async def test_denied_prompt_is_not_kept_for_an_outcome() -> None:
+    mgr, _, msg = _outcome_manager()
+    request = make_request()
+
+    assert await _approve_once(mgr, msg, request, emoji="❌") is ApprovalDecision.DENIED
+
+    assert request.id not in mgr._approved_messages
+
+
+@pytest.mark.anyio
+async def test_report_outcome_fits_one_discord_message() -> None:
+    mgr, _, msg = _outcome_manager()
+    request = make_request()
+    await _approve_once(mgr, msg, request)
+
+    await mgr.report_outcome(request, "x" * 5000, succeeded=False)
+
+    content = msg.reply.await_args.kwargs["content"]
+    assert len(content) <= 2000
+    assert content.endswith("…\n```")
+
+
+def test_kept_prompts_are_bounded() -> None:
+    from schwab_mcp.approvals import discord as discord_approvals
+
+    mgr = make_manager()
+    cap = discord_approvals._TRACKED_OUTCOME_MESSAGES
+    for index in range(cap + 5):
+        mgr._remember_approved(f"a{index}", MagicMock())
+
+    assert len(mgr._approved_messages) == cap
+    assert "a0" not in mgr._approved_messages
+    assert f"a{cap + 4}" in mgr._approved_messages

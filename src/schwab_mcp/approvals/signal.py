@@ -19,6 +19,7 @@ from schwab_mcp.approvals.base import (
     ApprovalManager,
     ApprovalRequest,
     format_arguments,
+    format_outcome,
     parse_account_names,
 )
 
@@ -195,6 +196,18 @@ class SignalApprovalManager(ApprovalManager):
                 self._pending.pop(sent_timestamp, None)
 
         return decision
+
+    async def report_outcome(
+        self,
+        request: ApprovalRequest,
+        outcome: str,
+        *,
+        succeeded: bool,
+    ) -> None:
+        """Send one notice with the write's outcome, keyed by approval id."""
+        marker = "✅" if succeeded else "⚠️"
+        header = f"{marker} schwab-mcp approval {request.id} for '{request.tool_name}' outcome: "
+        await self._send(header + format_outcome(outcome, _BODY_LIMIT - len(header)))
 
     async def _send(self, body: str) -> int:
         if self._client is None:
@@ -406,14 +419,32 @@ def _account_label(account_value: Any, account_names: Mapping[str, str]) -> str:
     return f"account …{last4}"
 
 
-def _render_cancel_order(args: Mapping[str, Any], account_names: Mapping[str, str]) -> str:
-    order_id = args.get("order_id")
-    # Like account_hash, order_id goes into the request path verbatim; only
-    # summarize plain ASCII digits so the prompt cannot misrepresent the
-    # target. Anything else goes to the verbose dump via the raised error.
-    if order_id is not None and not (isinstance(order_id, str) and order_id.isascii() and order_id.isdigit()):
+def _safe_order_id(order_id: Any) -> str | None:
+    """Return the order id as text if a summary can show it faithfully.
+
+    Like account_hash, order_id goes into the request path verbatim; only
+    summarize plain ASCII digits so the prompt cannot misrepresent the
+    target. Anything else goes to the verbose dump via the raised error.
+    """
+    if order_id is None:
+        return None
+    text = str(order_id) if isinstance(order_id, int) and not isinstance(order_id, bool) else order_id
+    if not (isinstance(text, str) and text.isascii() and text.isdigit()):
         raise ValueError(f"order_id cannot be summarized faithfully: {order_id!r}")
+    return text
+
+
+def _preview_suffix(args: Mapping[str, Any]) -> str:
+    preview = args.get("schwab_preview")
+    return f"\nSchwab preview: {preview}" if preview else ""
+
+
+def _render_cancel_order(args: Mapping[str, Any], account_names: Mapping[str, str]) -> str:
+    order_id = _safe_order_id(args.get("order_id"))
     account = _account_label(args.get("account_hash"), account_names)
+    current = args.get("current_order")
+    if current:
+        return f"cancel order {order_id or '?'} in {account}:\n{current}"
     return f"cancel order {order_id or '?'} in {account}."
 
 
@@ -423,11 +454,24 @@ def _render_place_previewed_order(args: Mapping[str, Any], account_names: Mappin
     account = _account_label(args.get("account_hash"), account_names)
     # The summary is one order per line (composite orders span several), so
     # it goes below the header rather than mid-sentence.
-    return f"place a previewed order in {account} (previewed via {original_tool}):\n{summary}"
+    return f"place a previewed order in {account} (previewed via {original_tool}):\n{summary}" + _preview_suffix(args)
+
+
+def _render_replace_previewed_order(args: Mapping[str, Any], account_names: Mapping[str, str]) -> str:
+    order_id = _safe_order_id(args.get("target_order_id"))
+    original_tool = args.get("original_tool") or "a preview tool"
+    account = _account_label(args.get("account_hash"), account_names)
+    current = args.get("current_order") or "?"
+    summary = args.get("order_summary") or "?"
+    return (
+        f"replace order {order_id or '?'} in {account} (previewed via {original_tool}):\n"
+        f"current:\n{current}\nnew:\n{summary}" + _preview_suffix(args)
+    )
 
 
 _TOOL_RENDERERS: Mapping[str, Any] = {
     "place_previewed_order": _render_place_previewed_order,
+    "replace_previewed_order": _render_replace_previewed_order,
     "cancel_order": _render_cancel_order,
 }
 

@@ -72,17 +72,22 @@ schwab-mcp server
 # Streamable HTTP (for reverse proxies / remote MCP connectors)
 schwab-mcp server --http --host 127.0.0.1 --port 8000
 
-# With Trading Enabled (Requires Discord Approval; token from SCHWAB_MCP_DISCORD_TOKEN)
+# With Trading Enabled (Requires Discord Approval and trading limits;
+# token from SCHWAB_MCP_DISCORD_TOKEN)
 schwab-mcp server \
   --discord-channel-id CHANNEL_ID \
-  --discord-approver YOUR_USER_ID
+  --discord-approver YOUR_USER_ID \
+  --max-order-value 2500 \
+  --max-daily-orders 5
 
 # Or approve over Signal instead (requires a local bbernhard/signal-cli-rest-api
 # daemon running in MODE=json-rpc or json-rpc-native; other modes cannot
 # stream replies and silently consume them)
 schwab-mcp server \
   --signal-account +15555550100 \
-  --signal-approver +15555550199
+  --signal-approver +15555550199 \
+  --max-order-value 2500 \
+  --max-daily-orders 5
 ```
 
 Default transport is **stdio** (Claude Desktop and most local MCP clients).
@@ -96,6 +101,20 @@ gateway or remote connector (MCP endpoint is `/mcp` on the bound host:port).
 > authenticating reverse proxy in front; use `--http-allow-remote` only when
 > that proxy is the sole route to the port (for example a container whose
 > published port only the proxy can reach).
+
+> **Trading limits are required.** Write tools are enabled only when both
+> `--max-order-value` and `--max-daily-orders` are set (any write mode,
+> including `--jesus-take-the-wheel`); otherwise the server refuses to start.
+> Every order is checked before the reviewer is asked: its estimated value
+> (highest price times largest leg quantity, times 100 for options, or
+> Schwab's preview order value when that is higher or the order has no price)
+> must not exceed the max, and an order whose value cannot be determined is
+> refused. The daily cap counts placements and replacements sent to Schwab per
+> US/Eastern day in `daily-orders.json` (0600) in the data directory, so it
+> survives a restart and is shared by every server process using that
+> directory; cancellations are not counted, and a denied or expired approval
+> does not use a slot. A refused order leaves its preview usable.
+> `--max-order-quantity` and `--allowed-symbol` are optional extra limits.
 
 > **Note**: For trading capabilities, you must set up an approval backend: either a Discord bot (see [Discord Setup Guide](docs/discord-setup.md)) or Signal via a local [signal-cli REST daemon](https://github.com/bbernhard/signal-cli-rest-api) running in `MODE=json-rpc` (or `json-rpc-native`). Configure either backend, not both. (The `signal` extra declares the websockets dependency explicitly; a default install already includes it transitively.)
 
@@ -117,6 +136,10 @@ You can configure the server using CLI flags or Environment Variables.
 | `--http-allow-remote` | N/A | Allow `--http` on a non-loopback `--host`. Only behind an authenticating proxy. |
 | `--port` | `MCP_PORT` | Bind port when using `--http` (default: `8000`). |
 | `--jesus-take-the-wheel`| N/A | **DANGER**. Bypasses Discord approval for trades. |
+| `--max-order-value` | `SCHWAB_MCP_MAX_ORDER_VALUE` | **Required for trading**. Largest estimated order value in dollars a write may send. |
+| `--max-daily-orders` | `SCHWAB_MCP_MAX_DAILY_ORDERS` | **Required for trading**. Most orders (placements and replacements) sent per US/Eastern day, counted across restarts. |
+| `--max-order-quantity` | `SCHWAB_MCP_MAX_ORDER_QUANTITY` | Optional. Largest quantity (shares or contracts) on any order leg. |
+| `--allowed-symbol` | `SCHWAB_MCP_ALLOWED_SYMBOLS` | Optional. Equity symbols or option underlyings orders may trade. Repeat the flag, or comma-separate in the env var. |
 | `--no-technical-tools` | N/A | Disables technical analysis tools (SMA, RSI, etc.). |
 | `--json` | N/A | Returns JSON instead of formatted text (useful for some agents). Null/empty fields are stripped to reduce token usage. |
 
