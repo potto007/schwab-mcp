@@ -791,11 +791,11 @@ class TestPrepareEquityOrderValidation:
 class TestPrepareOptionOrderValidation:
     def test_invalid_order_type_raises(self):
         with pytest.raises(ValueError, match="Invalid order_type"):
-            orders._prepare_option_order("SPY 251219C400", 1, "BUY_TO_OPEN", "STOP")
+            orders._prepare_option_order("SPY   251219C00400000", 1, "BUY_TO_OPEN", "STOP")
 
     def test_invalid_instruction_raises(self):
         with pytest.raises(ValueError, match="Invalid instruction"):
-            orders._prepare_option_order("SPY 251219C400", 1, "BUY", "MARKET")
+            orders._prepare_option_order("SPY   251219C00400000", 1, "BUY", "MARKET")
 
 
 class TestPrepareTrailingStopOrderValidation:
@@ -1007,14 +1007,14 @@ class TestPrepareOptionComboOrderValidation:
     def test_requires_at_least_two_legs(self):
         with pytest.raises(ValueError, match="at least two option legs"):
             orders._prepare_option_combo_order(
-                [{"instruction": "BUY_TO_OPEN", "symbol": "SPY 251219C500", "quantity": 1}],
+                [{"instruction": "BUY_TO_OPEN", "symbol": "SPY   251219C00500000", "quantity": 1}],
                 "NET_DEBIT",
             )
 
     def test_correct_spec_structure(self):
         legs = [
-            {"instruction": "BUY_TO_OPEN", "symbol": "SPY 251219C500", "quantity": 1},
-            {"instruction": "SELL_TO_OPEN", "symbol": "SPY 251219C510", "quantity": 1},
+            {"instruction": "BUY_TO_OPEN", "symbol": "SPY   251219C00500000", "quantity": 1},
+            {"instruction": "SELL_TO_OPEN", "symbol": "SPY   251219C00510000", "quantity": 1},
         ]
         spec = orders._prepare_option_combo_order(legs, "NET_DEBIT", price=2.50)
         assert spec["orderStrategyType"] == "SINGLE"
@@ -1081,7 +1081,7 @@ class TestBuildOrderFromDesc:
 
     def test_option_buy_to_open_market(self):
         desc: dict[str, Any] = {
-            "symbol": "SPY 251219C500",
+            "symbol": "SPY   251219C00500000",
             "quantity": 1,
             "instruction": "BUY_TO_OPEN",
             "order_type": "MARKET",
@@ -1094,7 +1094,7 @@ class TestBuildOrderFromDesc:
 
     def test_option_sell_to_close_limit(self):
         desc: dict[str, Any] = {
-            "symbol": "SPY 251219C500",
+            "symbol": "SPY   251219C00500000",
             "quantity": 2,
             "instruction": "SELL_TO_CLOSE",
             "order_type": "LIMIT",
@@ -1187,7 +1187,7 @@ class TestBuildOrderFromDesc:
 
     def test_trailing_stop_with_option_raises(self):
         desc: dict[str, Any] = {
-            "symbol": "SPY 251219C500",
+            "symbol": "SPY   251219C00500000",
             "quantity": 1,
             "instruction": "SELL_TO_CLOSE",
             "order_type": "TRAILING_STOP",
@@ -1591,7 +1591,7 @@ class TestPreviewReplacementOrder:
     def test_rejects_incompatible_known_fields(self, asset_type, order_type, incompatible):
         """Replacement validation rejects fields ignored by the selected builder."""
         replacement = {
-            "symbol": "SPY 251219C500" if asset_type == "OPTION" else "AAPL",
+            "symbol": "SPY   251219C00500000" if asset_type == "OPTION" else "AAPL",
             "quantity": 1,
             "instruction": "BUY_TO_OPEN" if asset_type == "OPTION" else "BUY",
             "order_type": order_type,
@@ -1653,7 +1653,7 @@ class TestPreviewReplacementOrder:
     def test_builds_supported_replacement_order_kinds(self, asset_type, instruction, order_type, extra, expected):
         """Replacement builders support options and equity trailing stops."""
         replacement = {
-            "symbol": "SPY 251219C500" if asset_type == "OPTION" else "AAPL",
+            "symbol": "SPY   251219C00500000" if asset_type == "OPTION" else "AAPL",
             "quantity": 1,
             "instruction": instruction,
             "order_type": order_type,
@@ -1884,7 +1884,7 @@ class TestPreviewOptionOrder:
         monkeypatch.setattr(orders, "call", fake_call)
 
         result = run(
-            orders.preview_option_order(ctx, "acc123", "SPY 230616C400", 1, "BUY_TO_OPEN", "LIMIT", price=2.50)
+            orders.preview_option_order(ctx, "acc123", "SPY   230616C00400000", 1, "BUY_TO_OPEN", "LIMIT", price=2.50)
         )
 
         assert "preview_id" in result
@@ -1895,7 +1895,7 @@ class TestPreviewOptionOrder:
         client = DummyPreviewClient()
         ctx = make_ctx(client)
         with pytest.raises(ValueError, match="Invalid instruction"):
-            run(orders.preview_option_order(ctx, "acc123", "SPY 230616C400", 1, "BOGUS", "LIMIT", price=2.50))
+            run(orders.preview_option_order(ctx, "acc123", "SPY   230616C00400000", 1, "BOGUS", "LIMIT", price=2.50))
 
     def test_stores_correct_spec_in_previews(self, monkeypatch):
         client = DummyPreviewClient()
@@ -1906,7 +1906,9 @@ class TestPreviewOptionOrder:
 
         monkeypatch.setattr(orders, "call", fake_call)
 
-        result = run(orders.preview_option_order(ctx, "acc123", "SPY 230616C400", 2, "BUY_TO_OPEN", "LIMIT", price=3.0))
+        result = run(
+            orders.preview_option_order(ctx, "acc123", "SPY   230616C00400000", 2, "BUY_TO_OPEN", "LIMIT", price=3.0)
+        )
 
         entry = ctx.previews.pop(result["preview_id"], "acc123", operation=orders.PreviewOperation.PLACE_ORDER)
         assert entry.tool_name == "preview_option_order"
@@ -2198,8 +2200,8 @@ class TestPreviewBracketOrder:
 
 class TestPreviewOptionComboOrder:
     _LEGS = [
-        {"instruction": "SELL_TO_OPEN", "symbol": "SPY 251121C500", "quantity": 1},
-        {"instruction": "BUY_TO_OPEN", "symbol": "SPY 251121C510", "quantity": 1},
+        {"instruction": "SELL_TO_OPEN", "symbol": "SPY   251121C00500000", "quantity": 1},
+        {"instruction": "BUY_TO_OPEN", "symbol": "SPY   251121C00510000", "quantity": 1},
     ]
 
     def test_returns_preview_shape(self, monkeypatch):

@@ -143,7 +143,7 @@ class TestBuildEquityOrderSpec:
 class TestBuildOptionOrderSpec:
     @pytest.fixture
     def symbol(self):
-        return "SPY 251219C500"
+        return "SPY   251219C00500000"
 
     @pytest.fixture
     def quantity(self):

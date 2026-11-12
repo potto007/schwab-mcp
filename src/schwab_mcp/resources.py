@@ -152,24 +152,24 @@ ORDER_TYPES: dict[str, Any] = {
 }
 
 OPTION_SYMBOLS: dict[str, Any] = {
-    "format": "{UNDERLYING} {YYMMDD}{C|P}{STRIKE}",
+    "format": "{UNDERLYING padded to 6 characters}{YYMMDD}{C|P}{STRIKE x 1000, 8 digits} (21 characters)",
     "components": {
-        "underlying": "Stock/ETF symbol (e.g., SPY, AAPL)",
+        "underlying": "Stock/ETF root of 1-6 uppercase letters, digits, or '.', right-padded with spaces to 6 (e.g., 'SPY   ', 'AAPL  ')",
         "expiration": "YYMMDD format (e.g., 251121 = November 21, 2025)",
         "contract_type": "C for Call, P for Put",
-        "strike": "Strike price (no decimals for whole numbers)",
+        "strike": "Strike price times 1000, zero-padded to 8 digits (e.g., 500 = 00500000, 250.5 = 00250500)",
     },
     "examples": [
         {
-            "symbol": "SPY 251121C500",
+            "symbol": "SPY   251121C00500000",
             "meaning": "SPY November 21, 2025 $500 Call",
         },
         {
-            "symbol": "AAPL 240315P150",
+            "symbol": "AAPL  240315P00150000",
             "meaning": "AAPL March 15, 2024 $150 Put",
         },
         {
-            "symbol": "TSLA 250117C250",
+            "symbol": "TSLA  250117C00250000",
             "meaning": "TSLA January 17, 2025 $250 Call",
         },
     ],
