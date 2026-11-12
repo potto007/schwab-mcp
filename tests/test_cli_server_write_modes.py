@@ -18,6 +18,7 @@ from schwab_mcp.approvals import (
     NoOpApprovalManager,
     SignalApprovalManager,
 )
+from schwab_mcp.limits import OrderLedger, TradingLimits
 from schwab_mcp.server import MCPServer, SchwabMCPServer
 
 
@@ -595,8 +596,13 @@ def isolated_server_cli_environment(monkeypatch, tmp_path: Path) -> Path:
         "SCHWAB_MCP_SIGNAL_ACCOUNT_NAMES",
         "MCP_HOST",
         "MCP_PORT",
+        "SCHWAB_MCP_MAX_ORDER_QUANTITY",
+        "SCHWAB_MCP_ALLOWED_SYMBOLS",
     ):
         monkeypatch.delenv(name, raising=False)
+    # Required to start any write mode; the ledger lands under XDG_DATA_HOME.
+    monkeypatch.setenv("SCHWAB_MCP_MAX_ORDER_VALUE", "10000")
+    monkeypatch.setenv("SCHWAB_MCP_MAX_DAILY_ORDERS", "20")
     return tmp_path / "token.yaml"
 
 
@@ -628,6 +634,8 @@ def sociable_cli_server(monkeypatch) -> dict[str, Any]:
         allow_write: bool,
         enable_technical_tools: bool = True,
         use_json: bool = False,
+        trading_limits: TradingLimits | None = None,
+        order_ledger: OrderLedger | None = None,
     ) -> SchwabMCPServer:
         server = real_server_type(
             name,
@@ -636,6 +644,8 @@ def sociable_cli_server(monkeypatch) -> dict[str, Any]:
             allow_write=allow_write,
             enable_technical_tools=enable_technical_tools,
             use_json=use_json,
+            trading_limits=trading_limits,
+            order_ledger=order_ledger,
         )
         captured["server"] = server
         captured["approval_manager"] = approval_manager

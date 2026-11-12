@@ -15,6 +15,11 @@ from schwab.client import AsyncClient
 from schwab_mcp import auth as mcp_auth, cli
 from schwab_mcp.approvals import ApprovalDecision, ApprovalManager, ApprovalRequest
 from schwab_mcp.context import SchwabContext, SchwabServerContext
+from schwab_mcp.limits import OrderLedger, TradingLimits
+
+# Limits loose enough that tests not about limits never hit them. The order
+# value must still be determinable (from prices or the preview).
+TEST_TRADING_LIMITS = TradingLimits(max_order_value=1e15, max_daily_orders=10**9)
 
 
 class DummyApprovalManager(ApprovalManager):
@@ -96,10 +101,20 @@ def cli_auth_capture(monkeypatch) -> dict[str, Any]:
 
 
 @pytest.fixture
-def cli_server_capture(monkeypatch) -> dict[str, Any]:
-    """Patch server dependencies and capture construction arguments."""
+def cli_server_capture(monkeypatch, tmp_path) -> dict[str, Any]:
+    """Patch server dependencies and capture construction arguments.
+
+    Trading limits are set through their env vars so write-mode tests start;
+    tests about missing limits unset them. The daily order ledger lives in
+    ``tmp_path``.
+    """
     captured: dict[str, Any] = {}
     monkeypatch.setattr(cli, "AsyncClient", CliFakeAsyncClient)
+    monkeypatch.setenv("SCHWAB_MCP_MAX_ORDER_VALUE", "10000")
+    monkeypatch.setenv("SCHWAB_MCP_MAX_DAILY_ORDERS", "20")
+    ledger_path = str(tmp_path / "daily-orders.json")
+    captured["ledger_path"] = ledger_path
+    monkeypatch.setattr(cli.tokens, "order_ledger_path", lambda _app: ledger_path)
 
     def fake_easy_client(**kwargs: Any) -> CliFakeAsyncClient:
         """Capture easy-client arguments and return a fake async client."""
@@ -119,8 +134,12 @@ def cli_server_capture(monkeypatch) -> dict[str, Any]:
             allow_write: bool,
             enable_technical_tools: bool = True,
             use_json: bool = False,
+            trading_limits: TradingLimits | None = None,
+            order_ledger: OrderLedger | None = None,
         ) -> None:
             """Record the server constructor arguments."""
+            captured["trading_limits"] = trading_limits
+            captured["order_ledger"] = order_ledger
             captured["server_name"] = name
             captured["server_client"] = client
             captured["approval_manager"] = approval_manager
@@ -195,6 +214,8 @@ def make_ctx(client: Any) -> SchwabContext:
     lifespan_context = SchwabServerContext(
         client=cast(AsyncClient, client),
         approval_manager=DummyApprovalManager(),
+        trading_limits=TEST_TRADING_LIMITS,
+        order_ledger=OrderLedger(None),
     )
     request_context = SimpleNamespace(
         lifespan_context=lifespan_context,

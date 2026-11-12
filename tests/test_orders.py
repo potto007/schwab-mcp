@@ -1518,7 +1518,7 @@ class DummyPreviewClient:
 
     async def preview_order(self, *args: Any, **kwargs: Any) -> Any:
         self.captured = {"args": args, "kwargs": kwargs}
-        return {"orderId": 999, "orderStrategy": {}, "orderValidationResult": {}}
+        return {"orderId": 999, "orderStrategy": {"orderValue": 100.0}, "orderValidationResult": {}}
 
     async def place_order(self, *args: Any, **kwargs: Any) -> Any:
         """Capture a placement request and return an empty response."""
@@ -1688,6 +1688,7 @@ class TestPreviewReplacementOrder:
             "BUY 100 AAPL LIMIT @ $150.00",
             operation=orders.PreviewOperation.REPLACE_ORDER,
             target_order_id="order-9",
+            order_value=100.0,
         )
         calls: list[dict[str, Any]] = []
         approval_requests: list[Any] = []
@@ -1735,6 +1736,7 @@ class TestPreviewReplacementOrder:
             "BUY 1 AAPL MARKET",
             operation=orders.PreviewOperation.REPLACE_ORDER,
             target_order_id="order-9",
+            order_value=100.0,
         )
 
         client = ctx.orders
@@ -1776,6 +1778,7 @@ class TestPreviewReplacementOrder:
             "BUY 1 AAPL MARKET",
             operation=orders.PreviewOperation.REPLACE_ORDER,
             target_order_id="order-9",
+            order_value=100.0,
         )
 
         async def fake_run_approval(ctx, request):

@@ -193,6 +193,7 @@ def test_cap_refusal_keeps_preview_usable(
         "SINGLE BUY 1 AAPL EQUITY MARKET",
         operation=PreviewOperation[operation],
         target_order_id=target,
+        order_value=100.0,
     )
     ctx.schwab.pending_approvals = _registration.MAX_PENDING_APPROVALS
 

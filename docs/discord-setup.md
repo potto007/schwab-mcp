@@ -59,6 +59,9 @@ flag, which other local users can see in `ps` and which lands in shell history:
 export SCHWAB_MCP_DISCORD_TOKEN="YOUR_BOT_TOKEN"
 export SCHWAB_MCP_DISCORD_CHANNEL_ID="YOUR_CHANNEL_ID"
 export SCHWAB_MCP_DISCORD_APPROVERS="YOUR_USER_ID"
+# Trading limits are required before write tools are enabled.
+export SCHWAB_MCP_MAX_ORDER_VALUE="2500"
+export SCHWAB_MCP_MAX_DAILY_ORDERS="5"
 uv run schwab-mcp server ...
 ```
 

@@ -87,7 +87,13 @@ compact defaults with `verbose=True` escape hatches where response size matters.
     that cannot be read, has no legs, has finished, or is not cancelable /
     editable. Previews refuse a Schwab-rejected preview and store
     `_preview_line()` (est. value, commission and fees, buying power,
-    warnings), which the place and replace prompts show as `schwab_preview`.
+    warnings), which the place and replace prompts show as `schwab_preview`,
+    plus `_preview_order_value()` for the limits check. Before approval both
+    executors require configured limits (`_trading_guard()`), run
+    `limits.check_order()` on the peeked preview, and reserve a daily slot,
+    all before the preview is consumed, so a refusal leaves it usable; the
+    slot is committed (`_commit_slot()`) right before the write and released
+    on denial or expiry.
     Both custom executors request approval and return
     compact post-write order status. Every approval summary is rendered by
     `_spec_summary()` from the built spec (all legs, nested child orders,

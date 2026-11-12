@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from conftest import run, working_order
+from conftest import TEST_TRADING_LIMITS, run, working_order
 from mcp.server.mcpserver import Context as MCPContext, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from schwab.client import AsyncClient
@@ -20,6 +20,7 @@ from schwab.client import AsyncClient
 from schwab_mcp import tools as tools_module
 from schwab_mcp.approvals import ApprovalDecision, ApprovalManager, ApprovalRequest
 from schwab_mcp.context import SchwabServerContext
+from schwab_mcp.limits import OrderLedger
 from schwab_mcp.server import SchwabMCPServer
 from schwab_mcp.tools import _registration, orders
 
@@ -65,7 +66,12 @@ class Harness:
         tools_module.register_tools(
             self.server, cast(AsyncClient, self.client), allow_write=True, enable_technical=True
         )
-        lifespan_context = SchwabServerContext(client=cast(AsyncClient, self.client), approval_manager=self.approvals)
+        lifespan_context = SchwabServerContext(
+            client=cast(AsyncClient, self.client),
+            approval_manager=self.approvals,
+            trading_limits=TEST_TRADING_LIMITS,
+            order_ledger=OrderLedger(None),
+        )
         request_context = SimpleNamespace(
             lifespan_context=lifespan_context, request_id="request-1", meta={"client_id": "client-1"}
         )
@@ -99,6 +105,8 @@ def _production_server(client: Any = None) -> MCPServer:
         allow_write=True,
         enable_technical_tools=True,
         use_json=True,
+        trading_limits=TEST_TRADING_LIMITS,
+        order_ledger=OrderLedger(None),
     )
     return cast(MCPServer, schwab_server._server)
 

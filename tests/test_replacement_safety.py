@@ -26,7 +26,7 @@ class ReplacementClient:
 
     async def preview_order(self, **kwargs: Any) -> dict[str, Any]:
         self.preview_payload = kwargs
-        return {"previewed": True}
+        return {"previewed": True, "orderStrategy": {"orderValue": 100.0}}
 
     async def get_instruments(self, symbol: str, **kwargs: Any) -> dict[str, Any]:
         return {"instruments": [{"symbol": symbol, "assetType": "EQUITY"}]}
