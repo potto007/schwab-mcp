@@ -524,7 +524,7 @@ def _build_option_order_spec(
         return limit_builder(symbol, quantity, _format_order_price(price))
 
 
-@with_config(ConfigDict(extra="forbid"))
+@with_config(ConfigDict(extra="forbid", strict=True))
 class _OrderDescInputRequired(TypedDict):
     """Required fields for an order leg description (TypedDict for MCP schema)."""
 
@@ -534,7 +534,7 @@ class _OrderDescInputRequired(TypedDict):
     order_type: str
 
 
-@with_config(ConfigDict(extra="forbid"))
+@with_config(ConfigDict(extra="forbid", strict=True))
 class _OrderDescInput(_OrderDescInputRequired, total=False):
     """TypedDict used as the MCP tool parameter type for order leg dicts.
 
