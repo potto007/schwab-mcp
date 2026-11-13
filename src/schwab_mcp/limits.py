@@ -441,4 +441,5 @@ __all__ = [
     "leg_symbols",
     "order_value",
     "parse_symbol_allowlist",
+    "quote_symbols",
 ]
