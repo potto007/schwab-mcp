@@ -3,6 +3,7 @@ order for cancel and replace (#26) and Schwab's preview result (#28)."""
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable
 from enum import Enum
 from typing import Any, cast
@@ -307,6 +308,55 @@ def test_schwab_rejected_preview_is_refused_and_not_stored() -> None:
         _equity_preview(ctx)
 
     assert ctx.previews._entries == {}
+
+
+@pytest.mark.parametrize(
+    ("rejects", "shown"),
+    [
+        pytest.param(["Account restricted"], "Account restricted", id="string"),
+        pytest.param([None], "rejects (no message)", id="null-entry"),
+        pytest.param([{}], "rejects (no message)", id="empty-mapping-entry"),
+        pytest.param({"code": "bad"}, "rejects (no message)", id="mapping"),
+        pytest.param("closed", "closed", id="scalar-string"),
+        pytest.param(7, "rejects (no message)", id="scalar-number"),
+    ],
+)
+def test_any_non_empty_rejection_is_refused(rejects: Any, shown: str) -> None:
+    rejected = {**PREVIEW, "orderValidationResult": {"rejects": rejects}}
+    client, approvals = FakeClient(preview=rejected), RecordingApprovals()
+    ctx = _ctx(client, approvals)
+
+    with pytest.raises(ValueError, match=re.escape(f"Schwab's preview rejected this order: {shown}")):
+        _equity_preview(ctx)
+
+    assert ctx.previews._entries == {}
+
+
+@pytest.mark.parametrize("validation", [["REJECT"], "rejected", 1])
+def test_unreadable_validation_result_is_refused(validation: Any) -> None:
+    preview = {**PREVIEW, "orderValidationResult": validation}
+    ctx = _ctx(FakeClient(preview=preview), RecordingApprovals())
+
+    with pytest.raises(ValueError, match="validation result Schwab returned is unreadable"):
+        _equity_preview(ctx)
+
+    assert ctx.previews._entries == {}
+
+
+@pytest.mark.parametrize("rejects", [None, [], {}, ""])
+def test_empty_rejections_are_accepted(rejects: Any) -> None:
+    accepted = {**PREVIEW, "orderValidationResult": {"rejects": rejects}}
+    ctx = _ctx(FakeClient(preview=accepted), RecordingApprovals())
+
+    _equity_preview(ctx)
+
+    assert len(ctx.previews._entries) == 1
+
+
+def test_warnings_in_unexpected_shapes_still_show() -> None:
+    preview = {"orderValidationResult": {"warns": ["Odd lot", None], "alerts": "Market closed"}}
+
+    assert orders._preview_line(preview).endswith("warnings: Odd lot | warns (no message) | Market closed")
 
 
 def test_place_prompt_carries_the_preview_line() -> None:
