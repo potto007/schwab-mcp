@@ -404,13 +404,15 @@ def _wrap_result_transform(func: ToolFn, transform: Callable[[Any], Any]) -> Too
 
 
 def _forbid_unknown_arguments(server: MCPServer, name: str) -> None:
-    """Make the registered tool ``name`` refuse unknown top-level arguments.
+    """Make the registered tool ``name`` refuse unknown and loosely typed arguments.
 
-    MCPServer builds each tool's argument model with pydantic's default of
-    ignoring extra keys, so a misnamed argument (``stop_loss`` for
-    ``loss_price``) would be dropped and the call would run without it. This
-    swaps in a subclass with ``extra="forbid"``, so such a call is refused
-    before conversion or execution, and advertises the closed schema. The SDK
+    MCPServer builds each tool's argument model with pydantic's defaults of
+    ignoring extra keys and coercing loose types, so a misnamed argument
+    (``stop_loss`` for ``loss_price``) would be dropped and the call would run
+    without it, and ``quantity: "5"`` or ``true`` would become 5 or 1. This
+    swaps in a subclass with ``extra="forbid"`` and ``strict=True``, so such a
+    call is refused before conversion or execution, and advertises the closed
+    schema. The SDK
     reads ``fn_metadata.arg_model`` on every call, so the swap takes effect at
     once. Registration fails rather than leaving a tool open if the SDK no
     longer exposes what this relies on.
@@ -424,7 +426,9 @@ def _forbid_unknown_arguments(server: MCPServer, name: str) -> None:
         types.new_class(
             base.__name__,
             (base,),
-            exec_body=lambda ns: ns.update(__module__=base.__module__, model_config=ConfigDict(extra="forbid")),
+            exec_body=lambda ns: ns.update(
+                __module__=base.__module__, model_config=ConfigDict(extra="forbid", strict=True)
+            ),
         ),
     )
     tool.fn_metadata.arg_model = closed
@@ -435,24 +439,33 @@ _UNKNOWN_ARGUMENT_PROBE = "schwab_mcp_unknown_argument_probe"
 
 
 def verify_closed_arguments(server: MCPServer) -> None:
-    """Refuse to start if any registered tool accepts unknown top-level arguments.
+    """Refuse to start if any registered tool is open or lax.
 
-    Probes each tool's real validator with an unknown key and checks that the
-    published schema says ``additionalProperties: false``. This catches a tool
-    registered around :func:`register_tool` and an SDK change that would make
-    :func:`_forbid_unknown_arguments` silently stop working.
+    A tool is open if it accepts unknown top-level arguments: each tool's real
+    validator is probed with an unknown key, and the published schema must say
+    ``additionalProperties: false``. A tool is lax if its argument model does
+    not validate in strict mode, so loose types would be coerced. This catches
+    a tool registered around :func:`register_tool` and an SDK change that would
+    make :func:`_forbid_unknown_arguments` silently stop working.
     """
     open_tools: list[str] = []
+    lax_tools: list[str] = []
     for tool in server._tool_manager.list_tools():
         try:
             tool.fn_metadata.validate_arguments({_UNKNOWN_ARGUMENT_PROBE: None})
         except ValidationError as exc:
             refused = any(error["type"] == "extra_forbidden" for error in exc.errors())
             if refused and tool.parameters.get("additionalProperties") is False:
+                if tool.fn_metadata.arg_model.model_config.get("strict") is not True:
+                    lax_tools.append(tool.name)
                 continue
         open_tools.append(tool.name)
     if open_tools:
         raise RuntimeError(f"Refusing to start: these tools accept unknown arguments: {', '.join(sorted(open_tools))}")
+    if lax_tools:
+        raise RuntimeError(
+            f"Refusing to start: these tools' argument models are not strict: {', '.join(sorted(lax_tools))}"
+        )
 
 
 def register_tool(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import logging
+import unicodedata
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -33,6 +34,21 @@ _TRACKED_OUTCOME_MESSAGES = 32
 # Discord's message content limit is 2000 characters; the outcome line gets
 # what is left after the header and the code fence.
 _OUTCOME_LIMIT = 1800
+
+_INLINE_CODE_LIMIT = 100
+
+
+def _inline_code(value: object, limit: int = _INLINE_CODE_LIMIT) -> str:
+    """Render a client-supplied value as inline code for readability.
+
+    Backticks and control/format characters (Unicode categories Cc and Cf,
+    including newlines and bidi overrides) are removed, and values longer than
+    ``limit`` characters are shortened with a trailing ellipsis.
+    """
+    text = "".join(char for char in str(value) if char != "`" and unicodedata.category(char) not in {"Cc", "Cf"})
+    if len(text) > limit:
+        text = text[: limit - 1] + "\u2026"
+    return f"`{text or '(empty)'}`"
 
 
 @dataclass(slots=True, frozen=True)
@@ -324,11 +340,11 @@ class DiscordApprovalManager(ApprovalManager):
         account_label = self._account_label(request.arguments)
         if account_label:
             embed.add_field(name="Account", value=account_label, inline=False)
-        embed.add_field(name="Request ID", value=request.request_id, inline=False)
+        embed.add_field(name="Request ID", value=_inline_code(request.request_id), inline=False)
         embed.add_field(name="Approval ID", value=request.id, inline=False)
         if request.client_id:
             # Client-supplied request metadata, not an authenticated identity.
-            embed.add_field(name="Client ID (unverified)", value=request.client_id, inline=False)
+            embed.add_field(name="Client ID (unverified)", value=_inline_code(request.client_id), inline=False)
         if request.arguments:
             embed.add_field(
                 name="Arguments",
@@ -355,11 +371,11 @@ class DiscordApprovalManager(ApprovalManager):
         account_label = self._account_label(request.arguments)
         if account_label:
             embed.add_field(name="Account", value=account_label, inline=False)
-        embed.add_field(name="Request ID", value=request.request_id, inline=False)
+        embed.add_field(name="Request ID", value=_inline_code(request.request_id), inline=False)
         embed.add_field(name="Approval ID", value=request.id, inline=False)
         if request.client_id:
             # Client-supplied request metadata, not an authenticated identity.
-            embed.add_field(name="Client ID (unverified)", value=request.client_id, inline=False)
+            embed.add_field(name="Client ID (unverified)", value=_inline_code(request.client_id), inline=False)
         if request.arguments:
             embed.add_field(
                 name="Arguments",

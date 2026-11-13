@@ -76,7 +76,7 @@ compact defaults with `verbose=True` escape hatches where response size matters.
     or preview requests; replacement target IDs use the same safe identifier
     rule (`utils.validate_identifier`), which the read tools (`get_order`,
     `get_orders`, `get_account`, `get_transactions`, `get_transaction`) also
-    apply. Order builders validate symbols (`_SAFE_SYMBOL`), positive integer
+    apply. Order builders validate symbols (equity: `_validate_equity_symbol`, `[A-Za-z0-9.$/-]{1,15}`, no whitespace; option and combo legs: `_validate_option_symbol`, Schwab's 21-character form with the root padded to 6; `OrderDesc` paths pick by `asset_type`), positive integer
     quantities, instructions, sessions and option-combo legs before any call;
     combo orders accept only NET_CREDIT/NET_DEBIT (price required) or
     NET_ZERO/MARKET (no price), and the nested `_OrderDescInput` schema is
@@ -113,10 +113,11 @@ compact defaults with `verbose=True` escape hatches where response size matters.
 - Uses FastMCP's `server.tool()` through `_registration.register_tool()` so tool
   docs, annotations, and parameter metadata come from Python signatures/docstrings.
   `register_tool()` then closes each tool's SDK argument model
-  (`_forbid_unknown_arguments()`, `extra="forbid"` plus a published
-  `additionalProperties: false`), so an unknown top-level argument is refused
-  before the tool runs; `verify_closed_arguments()` re-checks every registered
-  tool at server startup.
+  (`_forbid_unknown_arguments()`, `extra="forbid"` and `strict=True` plus a published
+  `additionalProperties: false`), so an unknown top-level argument or a loosely
+  typed one (`"5"` for an int) is refused before the tool runs;
+  `verify_closed_arguments()` re-checks every registered tool is closed and
+  strict at server startup.
 - Integrates with `schwab_mcp.approvals` for write safeguards: automatic approval
   wrapping for simple writes and explicit approval requests for previewed order
   placement.

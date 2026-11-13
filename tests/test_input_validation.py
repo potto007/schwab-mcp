@@ -84,10 +84,10 @@ _CASES.update(
             ctx, ACCOUNT, "SPY\n251219C500", 1, "BUY_TO_OPEN", "MARKET"
         ),
         "option-quantity": lambda ctx: orders.preview_option_order(
-            ctx, ACCOUNT, "SPY 251219C500", 0, "BUY_TO_OPEN", "MARKET"
+            ctx, ACCOUNT, "SPY   251219C00500000", 0, "BUY_TO_OPEN", "MARKET"
         ),
         "option-instruction": lambda ctx: orders.preview_option_order(
-            ctx, ACCOUNT, "SPY 251219C500", 1, "BUY", "MARKET"
+            ctx, ACCOUNT, "SPY   251219C00500000", 1, "BUY", "MARKET"
         ),
         "trailing-symbol": lambda ctx: orders.preview_equity_trailing_stop_order(
             ctx, ACCOUNT, "<b>AAPL</b>", 1, "SELL", trail_offset=1.0
@@ -128,10 +128,10 @@ _CASES.update(
             ctx, ACCOUNT, _combo_leg(0, price=9.99), "NET_DEBIT", price=1.0
         ),
         "combo-missing-key": lambda ctx: orders.preview_option_combo_order(
-            ctx, ACCOUNT, [{"symbol": "SPY 251219C500", "quantity": 1}, GOOD_COMBO[1]], "NET_DEBIT", price=1.0
+            ctx, ACCOUNT, [{"symbol": "SPY   251219C00500000", "quantity": 1}, GOOD_COMBO[1]], "NET_DEBIT", price=1.0
         ),
         "combo-not-a-dict": lambda ctx: orders.preview_option_combo_order(
-            ctx, ACCOUNT, cast(list[dict[str, Any]], ["SPY 251219C500", GOOD_COMBO[1]]), "NET_DEBIT", price=1.0
+            ctx, ACCOUNT, cast(list[dict[str, Any]], ["SPY   251219C00500000", GOOD_COMBO[1]]), "NET_DEBIT", price=1.0
         ),
         "combo-order-type": lambda ctx: orders.preview_option_combo_order(
             ctx, ACCOUNT, list(GOOD_COMBO), "NET\nDEBIT", price=1.0
@@ -185,12 +185,21 @@ def test_rejected_before_any_client_call(client: RecordingClient, case: str) -> 
 
 @pytest.mark.parametrize(
     "symbol",
-    ["AAPL", "BRK.B", "BRK/B", "$SPX", "/ES", "SPY   261218C00500000", "SPY 251219C500", "BF-B", "X"],
+    ["AAPL", "BRK.B", "BRK/B", "$SPX", "/ES", "BF-B", "X"],
 )
 def test_real_symbol_forms_are_accepted(client: RecordingClient, symbol: str) -> None:
     ctx = make_ctx(client)
 
     run(orders.preview_equity_order(ctx, ACCOUNT, symbol, 1, "BUY", "MARKET"))
+
+    assert "preview_order" in client.calls
+
+
+@pytest.mark.parametrize("symbol", ["SPY   261218C00500000", "SPY   251219C00500000"])
+def test_real_option_symbol_forms_are_accepted(client: RecordingClient, symbol: str) -> None:
+    ctx = make_ctx(client)
+
+    run(orders.preview_option_order(ctx, ACCOUNT, symbol, 1, "BUY_TO_OPEN", "MARKET"))
 
     assert "preview_order" in client.calls
 

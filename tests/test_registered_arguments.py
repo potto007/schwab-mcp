@@ -6,6 +6,9 @@ client reaches, so argument validation happens exactly as in production.
 
 from __future__ import annotations
 
+import datetime
+import json
+import types
 from collections.abc import Awaitable, Callable
 from enum import Enum
 from types import SimpleNamespace
@@ -15,6 +18,8 @@ import pytest
 from conftest import run, working_order
 from mcp.server.mcpserver import Context as MCPContext, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase
+from pydantic import ConfigDict
 from schwab.client import AsyncClient
 
 from schwab_mcp import tools as tools_module
@@ -142,6 +147,37 @@ def test_server_refuses_to_start_with_an_open_tool(monkeypatch: pytest.MonkeyPat
         _production_server()
 
 
+@pytest.mark.parametrize("name", _ALL_TOOLS)
+def test_every_production_tool_validates_arguments_strictly(name: str) -> None:
+    tool = _production_server()._tool_manager.get_tool(name)
+    assert tool is not None
+    assert tool.fn_metadata.arg_model.model_config.get("strict") is True
+
+
+def test_server_refuses_to_start_with_a_closed_but_lax_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tool that forbids unknown keys but coerces loose types fails startup."""
+
+    def close_without_strict(server: MCPServer, name: str) -> None:
+        tool = server._tool_manager.get_tool(name)
+        assert tool is not None
+        base: type[ArgModelBase] = tool.fn_metadata.arg_model
+        closed = cast(
+            type[ArgModelBase],
+            types.new_class(
+                base.__name__,
+                (base,),
+                exec_body=lambda ns: ns.update(__module__=base.__module__, model_config=ConfigDict(extra="forbid")),
+            ),
+        )
+        tool.fn_metadata.arg_model = closed
+        tool.parameters = closed.model_json_schema(by_alias=True)
+
+    monkeypatch.setattr(_registration, "_forbid_unknown_arguments", close_without_strict)
+
+    with pytest.raises(RuntimeError, match=r"not strict"):
+        _production_server()
+
+
 def test_tool_registered_around_register_tool_fails_startup(monkeypatch: pytest.MonkeyPatch) -> None:
     original = tools_module.register_tools
 
@@ -217,3 +253,86 @@ def test_write_tool_refuses_unknown_argument_before_approval(harness: Harness) -
     assert not result.is_error
     assert len(harness.approvals.requests) == 1
     assert [name for name, _ in harness.client.calls] == ["get_order", "cancel_order", "get_order"]
+
+
+_LIMIT = {**_EQUITY, "order_type": "LIMIT", "price": 150.0}
+_OCO_LEG = {"symbol": "AAPL", "quantity": 1, "instruction": "SELL", "order_type": "LIMIT", "price": 150.0}
+_OCO_STOP = {"symbol": "AAPL", "quantity": 1, "instruction": "SELL", "order_type": "STOP", "stop_price": 90.0}
+
+
+def _refused_loose(harness: Harness, name: str, arguments: dict[str, Any], pattern: str) -> None:
+    with pytest.raises(ToolError, match=rf"(?s){pattern}"):
+        harness.call(name, arguments)
+    assert harness.client.calls == []
+    assert harness.approvals.requests == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "pattern"),
+    [
+        pytest.param({"quantity": "5"}, r"quantity.*valid integer", id="string-quantity"),
+        pytest.param({"quantity": True}, r"quantity.*valid integer", id="bool-quantity"),
+        pytest.param({"price": "1.15"}, r"price.*valid number", id="string-price"),
+    ],
+)
+def test_equity_order_refuses_loosely_typed_arguments(
+    harness: Harness, overrides: dict[str, Any], pattern: str
+) -> None:
+    _refused_loose(harness, "preview_equity_order", {**_LIMIT, **overrides}, pattern)
+
+
+def test_nested_oco_leg_refuses_a_string_quantity(harness: Harness) -> None:
+    _refused_loose(
+        harness,
+        "preview_oco_order",
+        {"account_hash": ACCOUNT, "first_order": {**_OCO_LEG, "quantity": "5"}, "second_order": _OCO_STOP},
+        r"first_order.*quantity.*valid integer",
+    )
+
+
+def test_read_tool_refuses_an_int_where_a_string_is_expected(harness: Harness) -> None:
+    _refused_loose(harness, "get_order", {"account_hash": ACCOUNT, "order_id": 123}, r"order_id.*valid string")
+
+
+def test_integer_price_is_still_accepted_for_a_float_field(harness: Harness) -> None:
+    result = harness.call("preview_equity_order", {**_LIMIT, "price": 150})
+
+    assert not result.is_error
+    [(name, kwargs)] = [call for call in harness.client.calls if call[0] == "preview_order"]
+    assert kwargs["order_spec"]["price"] == "150.00"
+
+
+def test_nested_order_sent_as_a_json_string_is_still_accepted(harness: Harness) -> None:
+    arguments = {
+        "account_hash": ACCOUNT,
+        "first_order": json.dumps(_OCO_LEG),
+        "second_order": json.dumps(_OCO_STOP),
+    }
+
+    result = harness.call("preview_oco_order", arguments)
+
+    assert not result.is_error
+    assert [name for name, _ in harness.client.calls if name == "preview_order"] == ["preview_order"]
+
+
+def test_nested_order_sent_as_a_json_string_still_refuses_loose_leg_types(harness: Harness) -> None:
+    arguments = {
+        "account_hash": ACCOUNT,
+        "first_order": json.dumps({**_OCO_LEG, "quantity": "5"}),
+        "second_order": _OCO_STOP,
+    }
+
+    _refused_loose(harness, "preview_oco_order", arguments, r"first_order.*quantity.*valid integer")
+
+
+@pytest.mark.parametrize("name", ["get_option_chain", "get_advanced_option_chain"])
+def test_option_chain_expiration_dates_still_accept_iso_strings(name: str) -> None:
+    tool = _production_server()._tool_manager.get_tool(name)
+    assert tool is not None
+
+    validated = tool.fn_metadata.validate_arguments(
+        {"symbol": "AAPL", "from_date": "2024-03-01", "to_date": "2024-04-01"}
+    )
+
+    assert validated["from_date"] == datetime.date(2024, 3, 1)
+    assert validated["to_date"] == datetime.date(2024, 4, 1)
