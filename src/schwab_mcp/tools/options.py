@@ -158,19 +158,21 @@ async def get_option_chain(
     from_date: Annotated[
         datetime.date | None,
         Field(
+            strict=False,  # JSON has no date type: accept ISO strings
             description=(
                 "First expiration date in YYYY-MM-DD format. Defaults to today when both dates are omitted. "
                 "If to_date is omitted, the window ends 60 days later."
-            )
+            ),
         ),
     ] = None,
     to_date: Annotated[
         datetime.date | None,
         Field(
+            strict=False,  # JSON has no date type: accept ISO strings
             description=(
                 "Last expiration date in YYYY-MM-DD format. Defaults to today plus 60 days when both are omitted. "
                 "If from_date is omitted, the window starts today or this date if earlier."
-            )
+            ),
         ),
     ] = None,
     verbose: Annotated[
@@ -260,19 +262,21 @@ async def get_advanced_option_chain(
     from_date: Annotated[
         datetime.date | None,
         Field(
+            strict=False,  # JSON has no date type: accept ISO strings
             description=(
                 "First expiration date in YYYY-MM-DD format. Defaults to today when both dates are omitted. "
                 "If to_date is omitted, the window ends 60 days later."
-            )
+            ),
         ),
     ] = None,
     to_date: Annotated[
         datetime.date | None,
         Field(
+            strict=False,  # JSON has no date type: accept ISO strings
             description=(
                 "Last expiration date in YYYY-MM-DD format. Defaults to today plus 60 days when both are omitted. "
                 "If from_date is omitted, the window starts today or this date if earlier."
-            )
+            ),
         ),
     ] = None,
     volatility: Annotated[float | None, Field(description="Volatility for the ANALYTICAL strategy.")] = None,
