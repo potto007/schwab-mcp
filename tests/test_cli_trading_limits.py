@@ -128,3 +128,36 @@ def test_server_refuses_write_tools_without_limits() -> None:
             approval_manager=NoOpApprovalManager(),
             allow_write=True,
         )
+
+
+@pytest.mark.parametrize(
+    ("args", "env"),
+    [
+        pytest.param(["--allowed-symbol", ""], None, id="empty-flag"),
+        pytest.param(["--allowed-symbol", " , "], None, id="blank-flag"),
+        pytest.param([], " , ", id="blank-env"),
+    ],
+)
+def test_a_blank_allowlist_refuses_to_start(
+    cli_server_capture, cli_runner, no_limit_env, monkeypatch, args: list[str], env: str | None
+) -> None:
+    if env is not None:
+        monkeypatch.setenv("SCHWAB_MCP_ALLOWED_SYMBOLS", env)
+
+    result = _invoke(cli_runner, [*WRITE, "--max-order-value", "1000", "--max-daily-orders", "2", *args])
+
+    assert result.exit_code == 1
+    assert "lists no symbols" in result.output
+    assert "server_name" not in cli_server_capture
+
+
+def test_write_mode_prints_the_effective_limits(cli_server_capture, cli_runner, no_limit_env) -> None:
+    result = _invoke(
+        cli_runner,
+        [*WRITE, "--max-order-value", "2500", "--max-daily-orders", "4", "--allowed-symbol", "spy,aapl"],
+    )
+
+    assert result.exit_code == 0
+    assert (
+        "Trading limits: max order value $2,500.00; max 4 orders per day; max quantity none; allowed symbols AAPL, SPY"
+    ) in (result.stderr or result.output)

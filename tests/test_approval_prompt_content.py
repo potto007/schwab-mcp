@@ -3,12 +3,13 @@ order for cancel and replace (#26) and Schwab's preview result (#28)."""
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable
 from enum import Enum
 from typing import Any, cast
 
 import pytest
-from conftest import make_ctx, run
+from conftest import make_ctx, quotes_payload, run
 
 from schwab_mcp.approvals import ApprovalDecision, ApprovalManager, ApprovalRequest, signal as signal_backend
 from schwab_mcp.context import SchwabContext
@@ -113,6 +114,9 @@ class FakeClient:
         if self.order_error:
             raise SchwabAPIError(status_code=500, url="https://api.schwabapi.com/trader", body="boom")
         return self.order
+
+    async def get_quotes(self, symbols: list[str], **kwargs: Any) -> Any:
+        return quotes_payload(symbols)
 
     async def preview_order(self, *args: Any, **kwargs: Any) -> Any:
         self.calls.append("preview_order")
@@ -283,11 +287,24 @@ def test_preview_line_renders_schwab_preview() -> None:
     assert orders._preview_line(PREVIEW) == PREVIEW_LINE
 
 
-@pytest.mark.parametrize("preview", [{}, None, "ok", {"orderValidationResult": {"type": "ACCEPTED"}}])
-def test_preview_line_marks_missing_fields(preview: Any) -> None:
-    assert orders._preview_line(preview) == (
+def test_preview_line_marks_missing_fields() -> None:
+    assert orders._preview_line({"orderValidationResult": {"type": "ACCEPTED"}}) == (
         "est. value not provided; commission and fees not provided; buying power after not provided; no warnings"
     )
+
+
+@pytest.mark.parametrize("preview", [{}, None, "ok", {"orderValidationResult": None}])
+def test_preview_line_without_a_validation_result_does_not_claim_no_warnings(preview: Any) -> None:
+    assert orders._preview_line(preview) == (
+        "est. value not provided; commission and fees not provided; buying power after not provided; "
+        "warnings not provided"
+    )
+
+
+def test_preview_line_shows_at_most_three_warnings() -> None:
+    preview = {"orderValidationResult": {"warns": ["one", "two", "three", "four", "five"]}}
+
+    assert orders._preview_line(preview).endswith("warnings: one | two | three | +2 more")
 
 
 def test_preview_line_falls_back_to_projected_commission() -> None:
@@ -307,6 +324,55 @@ def test_schwab_rejected_preview_is_refused_and_not_stored() -> None:
         _equity_preview(ctx)
 
     assert ctx.previews._entries == {}
+
+
+@pytest.mark.parametrize(
+    ("rejects", "shown"),
+    [
+        pytest.param(["Account restricted"], "Account restricted", id="string"),
+        pytest.param([None], "rejects (no message)", id="null-entry"),
+        pytest.param([{}], "rejects (no message)", id="empty-mapping-entry"),
+        pytest.param({"code": "bad"}, "rejects (no message)", id="mapping"),
+        pytest.param("closed", "closed", id="scalar-string"),
+        pytest.param(7, "rejects (no message)", id="scalar-number"),
+    ],
+)
+def test_any_non_empty_rejection_is_refused(rejects: Any, shown: str) -> None:
+    rejected = {**PREVIEW, "orderValidationResult": {"rejects": rejects}}
+    client, approvals = FakeClient(preview=rejected), RecordingApprovals()
+    ctx = _ctx(client, approvals)
+
+    with pytest.raises(ValueError, match=re.escape(f"Schwab's preview rejected this order: {shown}")):
+        _equity_preview(ctx)
+
+    assert ctx.previews._entries == {}
+
+
+@pytest.mark.parametrize("validation", [["REJECT"], "rejected", 1])
+def test_unreadable_validation_result_is_refused(validation: Any) -> None:
+    preview = {**PREVIEW, "orderValidationResult": validation}
+    ctx = _ctx(FakeClient(preview=preview), RecordingApprovals())
+
+    with pytest.raises(ValueError, match="validation result Schwab returned is unreadable"):
+        _equity_preview(ctx)
+
+    assert ctx.previews._entries == {}
+
+
+@pytest.mark.parametrize("rejects", [None, [], {}, ""])
+def test_empty_rejections_are_accepted(rejects: Any) -> None:
+    accepted = {**PREVIEW, "orderValidationResult": {"rejects": rejects}}
+    ctx = _ctx(FakeClient(preview=accepted), RecordingApprovals())
+
+    _equity_preview(ctx)
+
+    assert len(ctx.previews._entries) == 1
+
+
+def test_warnings_in_unexpected_shapes_still_show() -> None:
+    preview = {"orderValidationResult": {"warns": ["Odd lot", None], "alerts": "Market closed"}}
+
+    assert orders._preview_line(preview).endswith("warnings: Odd lot | warns (no message) | Market closed")
 
 
 def test_place_prompt_carries_the_preview_line() -> None:
@@ -339,6 +405,43 @@ def test_replace_prompt_carries_the_preview_line() -> None:
 def _signal_body(request: ApprovalRequest) -> str:
     renderer = signal_backend._TOOL_RENDERERS[request.tool_name]
     return renderer(signal_backend._decode_arguments(request.arguments), {"1234": "Brokerage"})
+
+
+@pytest.mark.parametrize("target", ["0x1F", "1_000", "0b101", "0o17"])
+def test_signal_replace_never_shows_a_reinterpreted_order_id(target: str) -> None:
+    request = ApprovalRequest(
+        id="a",
+        tool_name="replace_previewed_order",
+        request_id="r",
+        client_id=None,
+        arguments={
+            "original_tool": "preview_replacement_order",
+            "current_order": WORKING_SUMMARY,
+            "order_summary": "SINGLE BUY 5 AAPL EQUITY LIMIT @ $149.00",
+            "schwab_preview": PREVIEW_LINE,
+            "preview_id": "p",
+            "account_hash": ACCOUNT,
+            "target_order_id": target,
+            "order_id": target,
+        },
+    )
+    manager = signal_backend.SignalApprovalManager(
+        signal_backend.SignalApprovalSettings(
+            api_url="http://127.0.0.1:8080", account="+15555550100", approver_numbers=frozenset({"+15555550199"})
+        )
+    )
+
+    body = manager._render_body(request)
+
+    assert target in body
+    for reinterpreted in ("order 31 ", "order 1000 ", "order 5 ", "order 15 "):
+        assert reinterpreted not in body
+
+
+def test_signal_decoding_keeps_values_that_do_not_round_trip() -> None:
+    decoded = signal_backend._decode_arguments({"a": "0x1F", "b": "1000123", "c": "'text'", "d": "1_000"})
+
+    assert decoded == {"a": "0x1F", "b": 1000123, "c": "text", "d": "1_000"}
 
 
 def test_signal_cancel_shows_current_order() -> None:

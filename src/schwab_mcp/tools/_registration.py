@@ -188,6 +188,35 @@ def describe_write_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def write_failure_outcome(exc: BaseException) -> str:
+    """How an approved write that raised is reported to the reviewer.
+
+    Only a Schwab client error (HTTP 4xx) means Schwab refused the request. A
+    timeout, dropped connection, server error or anything else may come after
+    Schwab accepted it, so the order may be live.
+    """
+    if isinstance(exc, SchwabAPIError) and 400 <= exc.status_code < 500:
+        return f"failed: {describe_write_error(exc)}"
+    return f"outcome unknown ({describe_write_error(exc)}); check Schwab"
+
+
+_CANCELLED_OUTCOME = "outcome unknown (the call was cancelled); check Schwab"
+
+# Reports sent from their own task, kept referenced until they finish.
+_BACKGROUND_REPORTS: set[asyncio.Task[None]] = set()
+
+
+def report_outcome_soon(context: SchwabContext, request: ApprovalRequest, outcome: str, *, succeeded: bool) -> None:
+    """Report from a task of its own, for a caller that is being cancelled.
+
+    A cancelled caller cannot await the report itself: the cancellation would
+    be delivered again at its next await.
+    """
+    task = asyncio.get_running_loop().create_task(report_outcome(context, request, outcome, succeeded=succeeded))
+    _BACKGROUND_REPORTS.add(task)
+    task.add_done_callback(_BACKGROUND_REPORTS.discard)
+
+
 async def report_outcome(context: SchwabContext, request: ApprovalRequest, outcome: str, *, succeeded: bool) -> None:
     """Tell the reviewer what an approved write did, best effort.
 
@@ -264,8 +293,11 @@ def _wrap_with_approval(func: ToolFn) -> ToolFn:
                 result = func(*bound.args, **bound.kwargs)
                 if inspect.isawaitable(result):
                     result = await result
+            except asyncio.CancelledError:
+                report_outcome_soon(context, request, _CANCELLED_OUTCOME, succeeded=False)
+                raise
             except Exception as exc:
-                await report_outcome(context, request, f"failed: {describe_write_error(exc)}", succeeded=False)
+                await report_outcome(context, request, write_failure_outcome(exc), succeeded=False)
                 raise
             await report_outcome(context, request, "completed", succeeded=True)
             return result
@@ -471,6 +503,8 @@ __all__ = [
     "describe_write_error",
     "register_tool",
     "report_outcome",
+    "report_outcome_soon",
     "run_approval",
+    "write_failure_outcome",
     "verify_closed_arguments",
 ]

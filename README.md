@@ -105,11 +105,20 @@ gateway or remote connector (MCP endpoint is `/mcp` on the bound host:port).
 > **Trading limits are required.** Write tools are enabled only when both
 > `--max-order-value` and `--max-daily-orders` are set (any write mode,
 > including `--jesus-take-the-wheel`); otherwise the server refuses to start.
-> Every order is checked before the reviewer is asked: its estimated value
-> (highest price times largest leg quantity, times 100 for options, or
-> Schwab's preview order value when that is higher or the order has no price)
-> must not exceed the max, and an order whose value cannot be determined is
-> refused. The daily cap counts placements and replacements sent to Schwab per
+> Every order is checked before the reviewer is asked, against fresh market
+> quotes for each leg: its estimated value must not exceed the max. Shares
+> count at the higher of the order price and the market, so a sell or stop far
+> from the market is valued at the market; a long option counts its premium
+> times 100; a short option counts its strike plus premium times 100, unless
+> it is matched with a long option of the same underlying, expiry, type and
+> quantity, when the spread counts its strike width plus the long premium.
+> Composites count conservatively: a triggered order adds its stages, so a
+> bracket counts as its entry plus its largest exit, and a one-cancels-other
+> counts its largest branch. Schwab's preview order value can only raise the
+> figure. An order with a leg that has no market quote, or whose value cannot
+> be determined, is refused. The effective limits are printed to stderr at
+> startup, and a symbol allowlist that is given but lists no symbols refuses
+> to start. The daily cap counts placements and replacements sent to Schwab per
 > US/Eastern day in `daily-orders.json` (0600) in the data directory, so it
 > survives a restart and is shared by every server process using that
 > directory; cancellations are not counted, and a denied or expired approval

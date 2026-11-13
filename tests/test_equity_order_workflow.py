@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 import pytest
-from conftest import make_ctx, run
+from conftest import make_ctx, quotes_payload, run
 
 from schwab_mcp.approvals import ApprovalDecision, ApprovalManager, ApprovalRequest
 from schwab_mcp.context import SchwabContext
@@ -83,6 +83,10 @@ class EquityOrdersClient:
             json={"instruments": [{"symbol": symbol, "assetType": "EQUITY"}]},
             request=request,
         )
+
+    async def get_quotes(self, symbols: list[str], **kwargs: Any) -> httpx.Response:
+        request = httpx.Request("GET", "https://api.schwabapi.com/marketdata/v1/quotes")
+        return httpx.Response(200, json=quotes_payload(symbols), request=request)
 
     async def preview_order(self, account_hash: str, order_spec: dict[str, Any]) -> httpx.Response:
         self.events.append("preview_submitted")

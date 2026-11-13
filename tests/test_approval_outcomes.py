@@ -13,8 +13,9 @@ from collections.abc import Awaitable, Callable
 from enum import Enum
 from typing import Any, cast
 
+import httpx
 import pytest
-from conftest import make_ctx, run, working_order
+from conftest import make_ctx, quotes_payload, run, working_order
 
 from schwab_mcp.approvals import ApprovalDecision, ApprovalManager, ApprovalRequest, NoOpApprovalManager
 from schwab_mcp.approvals.base import format_outcome
@@ -72,6 +73,9 @@ class Client:
 
     async def get_instruments(self, symbol: str, **kwargs: Any) -> Any:
         return {"instruments": [{"symbol": symbol, "assetType": "EQUITY"}]}
+
+    async def get_quotes(self, symbols: list[str], **kwargs: Any) -> Any:
+        return quotes_payload(symbols)
 
     async def preview_order(self, *args: Any, **kwargs: Any) -> Any:
         return {}
@@ -189,14 +193,56 @@ def test_failed_place_reports_the_schwab_error_without_the_account_hash() -> Non
     assert ACCOUNT not in outcome
 
 
-def test_failed_place_with_an_unexpected_error_reports_its_type() -> None:
-    client, approvals = Client([], write_error=ConnectionError(f"reset talking to {ACCOUNT}")), OutcomeApprovals()
+@pytest.mark.parametrize(
+    ("error", "shown"),
+    [
+        pytest.param(
+            ConnectionError(f"reset talking to {ACCOUNT}"), "ConnectionError: reset talking to …1234", id="connection"
+        ),
+        pytest.param(httpx.ReadTimeout("timed out"), "ReadTimeout: timed out", id="timeout"),
+        pytest.param(
+            SchwabAPIError(status_code=503, url="https://api.schwabapi.com/trader", body="busy"),
+            "Schwab API error (HTTP 503): busy",
+            id="server-error",
+        ),
+    ],
+)
+def test_a_write_that_may_have_reached_schwab_is_reported_as_unknown(error: Exception, shown: str) -> None:
+    client, approvals = Client([], write_error=error), OutcomeApprovals()
 
-    with pytest.raises(ConnectionError):
+    with pytest.raises(type(error)):
         _place(_ctx(client, approvals))
 
     [(_, outcome, succeeded)] = approvals.outcomes
-    assert outcome == "place failed: ConnectionError: reset talking to …1234"
+    assert outcome == f"place outcome unknown ({shown}); check Schwab"
+    assert succeeded is False
+
+
+def test_a_cancelled_write_is_still_reported() -> None:
+    started = asyncio.Event()
+
+    class HangingClient(Client):
+        async def place_order(self, *args: Any, **kwargs: Any) -> Any:
+            started.set()
+            await asyncio.Event().wait()
+
+    client, approvals = HangingClient([]), OutcomeApprovals()
+    ctx = _ctx(client, approvals)
+    preview = run(orders.preview_equity_order(ctx, ACCOUNT, "AAPL", 1, "BUY", "LIMIT", price=1.0))
+
+    async def scenario() -> None:
+        task = asyncio.create_task(orders.place_previewed_order(ctx, ACCOUNT, preview["preview_id"]))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    run(scenario())
+
+    [(_, outcome, succeeded)] = approvals.outcomes
+    assert outcome == "place outcome unknown (the call was cancelled); check Schwab"
     assert succeeded is False
 
 
@@ -334,7 +380,7 @@ def test_wrapped_write_tool_reports_failure() -> None:
     with pytest.raises(ValueError, match="bad x"):
         run(wrapped(ctx, "x"))
     assert [(outcome, succeeded) for _, outcome, succeeded in approvals.outcomes] == [
-        ("failed: ValueError: bad x", False)
+        ("outcome unknown (ValueError: bad x); check Schwab", False)
     ]
 
 

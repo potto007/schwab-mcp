@@ -23,7 +23,7 @@ compact defaults with `verbose=True` escape hatches where response size matters.
   so a refusal leaves it usable. After an approved write, `report_outcome()`
   sends the reviewer one outcome line through the approval manager (bounded
   by `_OUTCOME_REPORT_TIMEOUT_SECONDS`; failures are logged, never raised).
-  Wrapped write tools report `completed` or `failed: <error>`;
+  Wrapped write tools report `completed`, `failed: <error>` for a Schwab 4xx, or `outcome unknown (<error>); check Schwab` for anything else (`write_failure_outcome()`); a cancelled call is reported from its own task (`report_outcome_soon()`);
   `describe_write_error()` shows a Schwab error's status and body, not its
   URL.
 - `_protocols.py` defines Protocol facades for each Schwab client namespace
@@ -89,7 +89,8 @@ compact defaults with `verbose=True` escape hatches where response size matters.
     `_preview_line()` (est. value, commission and fees, buying power,
     warnings), which the place and replace prompts show as `schwab_preview`,
     plus `_preview_order_value()` for the limits check. Before approval both
-    executors require configured limits (`_trading_guard()`), run
+    executors require configured limits (`_trading_guard()`), fetch market
+    quotes for every leg (`_market_quotes()`; unavailable quotes refuse), run
     `limits.check_order()` on the peeked preview, and reserve a daily slot,
     all before the preview is consumed, so a refusal leaves it usable; the
     slot is committed (`_commit_slot()`) right before the write and released

@@ -1,5 +1,6 @@
 """Order placement, management, and preview tools for the Schwab MCP server."""
 
+import asyncio
 import logging
 import math
 import re
@@ -31,16 +32,17 @@ from typing_extensions import TypedDict
 
 from schwab_mcp.approvals import ApprovalDecision, ApprovalRequest
 from schwab_mcp.context import SchwabContext
-from schwab_mcp.limits import OrderLedger, OrderSlot, TradingLimits, check_order
+from schwab_mcp.limits import OrderLedger, OrderSlot, TradingLimits, check_order, leg_symbols
 from schwab_mcp.previews import PreviewOperation
 from schwab_mcp.tools._dates import parse_date
 from schwab_mcp.tools._protocols import ToolsClient
 from schwab_mcp.tools._registration import (
-    describe_write_error,
     ensure_approval_capacity,
     register_tool,
     report_outcome,
+    report_outcome_soon,
     run_approval,
+    write_failure_outcome,
 )
 from schwab_mcp.tools.order_helpers import (
     equity_buy_limit,
@@ -914,6 +916,11 @@ def _write_outcome(action: str, result: JSONType) -> str:
     return line
 
 
+def _shorten_account(outcome: str, account_hash: str) -> str:
+    # Error text can echo the request URL; show the account the way prompts do.
+    return outcome.replace(account_hash, f"…{account_hash[-4:]}") if account_hash else outcome
+
+
 async def _report_order_outcome(
     ctx: SchwabContext,
     request: ApprovalRequest,
@@ -922,10 +929,7 @@ async def _report_order_outcome(
     *,
     succeeded: bool,
 ) -> None:
-    # Error text can echo the request URL; show the account the way prompts do.
-    if account_hash:
-        outcome = outcome.replace(account_hash, f"…{account_hash[-4:]}")
-    await report_outcome(ctx, request, outcome, succeeded=succeeded)
+    await report_outcome(ctx, request, _shorten_account(outcome, account_hash), succeeded=succeeded)
 
 
 async def _run_order_write(
@@ -941,19 +945,32 @@ async def _run_order_write(
     """Run an approved order write, then report what happened to the reviewer.
 
     ``write`` sends the order to Schwab; ``finish`` fetches its status. A
-    failure in ``write`` is reported as a failure. Once ``write`` succeeded
-    the order exists, so a failure in ``finish`` is still reported as a
-    completed write with an unconfirmed status.
+    Schwab refusal (HTTP 4xx) in ``write`` is reported as a failure; any other
+    error, or a cancelled call, may come after Schwab accepted the order, so
+    it is reported as an unknown outcome. Once ``write`` succeeded the order
+    exists, so a failure in ``finish`` is still reported as a completed write
+    with an unconfirmed status.
     """
     try:
         written = await write()
-    except Exception as exc:
-        await _report_order_outcome(
-            ctx, request, account_hash, f"{verb} failed: {describe_write_error(exc)}", succeeded=False
+    except asyncio.CancelledError:
+        report_outcome_soon(
+            ctx,
+            request,
+            _shorten_account(f"{verb} outcome unknown (the call was cancelled); check Schwab", account_hash),
+            succeeded=False,
         )
+        raise
+    except Exception as exc:
+        await _report_order_outcome(ctx, request, account_hash, f"{verb} {write_failure_outcome(exc)}", succeeded=False)
         raise
     try:
         result = await finish(written)
+    except asyncio.CancelledError:
+        report_outcome_soon(
+            ctx, request, _shorten_account(_write_outcome(action, written), account_hash), succeeded=True
+        )
+        raise
     except Exception:
         await _report_order_outcome(ctx, request, account_hash, _write_outcome(action, written), succeeded=True)
         raise
@@ -967,6 +984,11 @@ async def _commit_slot(ctx: SchwabContext, request: ApprovalRequest, account_has
         slot.commit()
     except PermissionError as exc:
         await _report_order_outcome(ctx, request, account_hash, f"not sent: {exc}", succeeded=False)
+        raise
+    except Exception as exc:
+        await _report_order_outcome(
+            ctx, request, account_hash, f"not sent: {type(exc).__name__}: {exc}", succeeded=False
+        )
         raise
 
 
@@ -1322,6 +1344,9 @@ async def _fetch_current_order(ctx: SchwabContext, account_hash: str, order_id: 
 
 
 _PREVIEW_MESSAGE_LIMIT = 160
+# A noisy preview must stay approvable: Discord auto-denies a prompt field
+# over 1024 characters, so the prompt shows the first few warnings.
+_PREVIEW_WARNING_LIMIT = 3
 
 
 def _money(value: Any) -> str | None:
@@ -1331,17 +1356,34 @@ def _money(value: Any) -> str | None:
     return f"{sign}${abs(value):,.2f}"
 
 
+def _preview_entries(value: Any) -> list[Any]:
+    """Entries of one validation kind, whatever shape Schwab sent.
+
+    Only an absent or empty value means "none": a non-list value counts as one
+    entry, so an unexpected shape can never turn a rejection into an accept.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, (dict, str)) and not value:
+        return []
+    return [value]
+
+
 def _preview_messages(validation: Any, kinds: tuple[str, ...]) -> list[str]:
     messages: list[str] = []
     if not isinstance(validation, dict):
         return messages
     for kind in kinds:
-        entries = validation.get(kind)
-        for entry in entries if isinstance(entries, list) else []:
-            if not isinstance(entry, dict):
-                continue
-            raw = entry.get("message") or entry.get("activityMessage") or entry.get("validationRuleName") or kind
-            text = " ".join("".join(c if c.isprintable() else " " for c in str(raw)).split())
+        for entry in _preview_entries(validation.get(kind)):
+            raw: Any = None
+            if isinstance(entry, dict):
+                raw = entry.get("message") or entry.get("activityMessage") or entry.get("validationRuleName")
+            elif isinstance(entry, str):
+                raw = entry
+            text = " ".join("".join(c if c.isprintable() else " " for c in str(raw or "")).split())
+            text = text or f"{kind} (no message)"
             if len(text) > _PREVIEW_MESSAGE_LIMIT:
                 text = text[: _PREVIEW_MESSAGE_LIMIT - 1] + "\u2026"
             messages.append(text)
@@ -1352,7 +1394,10 @@ def _refuse_rejected_preview(preview: Any) -> None:
     """Raise if Schwab's preview rejected the order, so it is never cached."""
     if not isinstance(preview, dict):
         return
-    rejects = _preview_messages(preview.get("orderValidationResult"), ("rejects",))
+    validation = preview.get("orderValidationResult")
+    if validation and not isinstance(validation, dict):
+        raise ValueError("Refusing this preview: the validation result Schwab returned is unreadable.")
+    rejects = _preview_messages(validation, ("rejects",))
     if rejects:
         raise ValueError("Schwab's preview rejected this order: " + " | ".join(rejects))
 
@@ -1387,6 +1432,46 @@ def _trading_guard(ctx: SchwabContext) -> tuple[TradingLimits, OrderLedger]:
     return limits, ledger
 
 
+_QUOTE_PRICE_FIELDS = ("lastPrice", "mark", "askPrice", "bidPrice")
+
+
+def _quote_reference(entry: Any) -> float | None:
+    """Highest positive last, mark, ask or bid price in one Schwab quote entry."""
+    quote = entry.get("quote") if isinstance(entry, dict) else None
+    if not isinstance(quote, dict):
+        return None
+    prices = [
+        float(price)
+        for price in (quote.get(field) for field in _QUOTE_PRICE_FIELDS)
+        if not isinstance(price, bool) and isinstance(price, (int, float)) and math.isfinite(price) and price > 0
+    ]
+    return max(prices) if prices else None
+
+
+async def _market_quotes(ctx: SchwabContext, order_spec: dict[str, Any]) -> dict[str, float]:
+    """Reference prices for every leg symbol, so the value cap uses the market.
+
+    A quote that cannot be fetched refuses the order: without it a sell or a
+    stop far from the market could understate the order's value.
+    """
+    symbols = leg_symbols(order_spec)
+    if not symbols:
+        return {}
+    try:
+        payload = await call(ctx.quotes.get_quotes, symbols)
+    except (SchwabAPIError, ValueError, httpx.TransportError) as exc:
+        raise PermissionError(
+            f"Refusing order: market quotes are unavailable ({type(exc).__name__}), so its value cannot be bounded."
+        ) from exc
+    quotes: dict[str, float] = {}
+    if isinstance(payload, dict):
+        for symbol, entry in payload.items():
+            price = _quote_reference(entry)
+            if price is not None:
+                quotes[str(symbol)] = price
+    return quotes
+
+
 def _preview_order_value(preview: Any) -> float | None:
     """Schwab's estimated order value from a preview, if it returned a usable one."""
     payload: dict[str, Any] = preview if isinstance(preview, dict) else {}
@@ -1415,12 +1500,21 @@ def _preview_line(preview: Any) -> str:
     value = _money(balance.get("orderValue")) or _money(strategy.get("orderValue"))
     fees = _preview_fees(payload, balance)
     buying_power = _money(balance.get("projectedBuyingPower"))
-    warnings = _preview_messages(payload.get("orderValidationResult"), ("warns", "alerts", "reviews"))
+    validation = payload.get("orderValidationResult")
+    warnings = _preview_messages(validation, ("warns", "alerts", "reviews"))
+    if len(warnings) > _PREVIEW_WARNING_LIMIT:
+        hidden = len(warnings) - _PREVIEW_WARNING_LIMIT
+        warnings = [*warnings[:_PREVIEW_WARNING_LIMIT], f"+{hidden} more"]
+    if warnings:
+        warning_text = "warnings: " + " | ".join(warnings)
+    elif isinstance(validation, dict):
+        warning_text = "no warnings"
+    else:
+        warning_text = "warnings not provided"
     missing = "not provided"
     return (
         f"est. value {value or missing}; commission and fees {fees or missing}; "
-        f"buying power after {buying_power or missing}; "
-        + ("warnings: " + " | ".join(warnings) if warnings else "no warnings")
+        f"buying power after {buying_power or missing}; {warning_text}"
     )
 
 
@@ -2038,12 +2132,13 @@ async def place_previewed_order(
     fails or returns no data. *Write operation.*
     """
     limits, ledger = _trading_guard(ctx)
-    ensure_approval_capacity(ctx, "place_previewed_order")
     peeked = ctx.previews.peek(preview_id, account_hash, operation=PreviewOperation.PLACE_ORDER)
-    check_order(limits, peeked.order_spec, peeked.order_value)
-    # No await from here to run_approval's own cap check: the limit checks,
-    # the daily slot, consuming the preview and requesting approval happen
-    # together, and a refusal above leaves the preview usable.
+    quotes = await _market_quotes(ctx, peeked.order_spec)
+    check_order(limits, peeked.order_spec, peeked.order_value, quotes)
+    # No await from here to run_approval's own cap check: checking the cap,
+    # taking a daily slot, consuming the preview and requesting approval
+    # happen together, and a refusal leaves the preview usable.
+    ensure_approval_capacity(ctx, "place_previewed_order")
     slot = ledger.reserve(limits.max_daily_orders)
     try:
         entry = ctx.previews.pop(preview_id, account_hash, operation=PreviewOperation.PLACE_ORDER)
@@ -2111,7 +2206,8 @@ async def replace_previewed_order(
     target_order_id = peeked.target_order_id.strip() if peeked.target_order_id is not None else None
     if not target_order_id:
         raise ValueError("Replacement preview is missing its target order id.")
-    check_order(limits, peeked.order_spec, peeked.order_value)
+    quotes = await _market_quotes(ctx, peeked.order_spec)
+    check_order(limits, peeked.order_spec, peeked.order_value, quotes)
     current_order = await _fetch_current_order(ctx, account_hash, target_order_id, "replace")
     # No await from here to run_approval's own cap check: checking the cap,
     # taking a daily slot, consuming the preview and requesting approval

@@ -246,6 +246,16 @@ def _select_write_mode(
     return DiscordApprovalManager(settings), True
 
 
+def _describe_limits(limits: TradingLimits) -> str:
+    """One line with the effective trading limits, for the startup log."""
+    quantity = "none" if limits.max_order_quantity is None else str(limits.max_order_quantity)
+    symbols = "any" if limits.allowed_symbols is None else ", ".join(sorted(limits.allowed_symbols))
+    return (
+        f"max order value ${limits.max_order_value:,.2f}; max {limits.max_daily_orders} orders per day; "
+        f"max quantity {quantity}; allowed symbols {symbols}"
+    )
+
+
 @cli.command("server")
 @_common_options("Path to Schwab token file")
 @click.option(
@@ -634,16 +644,22 @@ def server(
                 )
                 return 1
             try:
+                allowed_symbols = parse_symbol_allowlist(allowed_symbol_values)
+                if allowed_symbol_values and allowed_symbols is None:
+                    # A blank value (often an unset shell variable) must not
+                    # silently remove the allowlist.
+                    raise ValueError("the symbol allowlist was given but lists no symbols")
                 trading_limits = TradingLimits(
                     max_order_value=max_order_value,
                     max_daily_orders=max_daily_orders,
                     max_order_quantity=max_order_quantity,
-                    allowed_symbols=parse_symbol_allowlist(allowed_symbol_values),
+                    allowed_symbols=allowed_symbols,
                 )
                 order_ledger = OrderLedger(tokens.order_ledger_path(APP_NAME))
             except ValueError as exc:
                 send_error_response(f"Invalid trading limits: {exc}", code=400, details={"error": str(exc)})
                 return 1
+            click.echo(f"Trading limits: {_describe_limits(trading_limits)}", err=True)
         elif any(
             (
                 max_order_value is not None,
