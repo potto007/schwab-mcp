@@ -1216,6 +1216,9 @@ async def _fetch_current_order(ctx: SchwabContext, account_hash: str, order_id: 
 
 
 _PREVIEW_MESSAGE_LIMIT = 160
+# A noisy preview must stay approvable: Discord auto-denies a prompt field
+# over 1024 characters, so the prompt shows the first few warnings.
+_PREVIEW_WARNING_LIMIT = 3
 
 
 def _money(value: Any) -> str | None:
@@ -1307,12 +1310,21 @@ def _preview_line(preview: Any) -> str:
     value = _money(balance.get("orderValue")) or _money(strategy.get("orderValue"))
     fees = _preview_fees(payload, balance)
     buying_power = _money(balance.get("projectedBuyingPower"))
-    warnings = _preview_messages(payload.get("orderValidationResult"), ("warns", "alerts", "reviews"))
+    validation = payload.get("orderValidationResult")
+    warnings = _preview_messages(validation, ("warns", "alerts", "reviews"))
+    if len(warnings) > _PREVIEW_WARNING_LIMIT:
+        hidden = len(warnings) - _PREVIEW_WARNING_LIMIT
+        warnings = [*warnings[:_PREVIEW_WARNING_LIMIT], f"+{hidden} more"]
+    if warnings:
+        warning_text = "warnings: " + " | ".join(warnings)
+    elif isinstance(validation, dict):
+        warning_text = "no warnings"
+    else:
+        warning_text = "warnings not provided"
     missing = "not provided"
     return (
         f"est. value {value or missing}; commission and fees {fees or missing}; "
-        f"buying power after {buying_power or missing}; "
-        + ("warnings: " + " | ".join(warnings) if warnings else "no warnings")
+        f"buying power after {buying_power or missing}; {warning_text}"
     )
 
 

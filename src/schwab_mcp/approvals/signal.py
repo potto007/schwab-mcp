@@ -359,14 +359,18 @@ def _decode_arguments(arguments: Mapping[str, str]) -> dict[str, Any]:
     truncates at 256 chars; ``ast.literal_eval`` reverses the repr. Tools that
     build their own request (``place_previewed_order`` in `tools/orders.py`)
     pass plain strings, and truncated reprs don't parse; both fall back to the
-    raw string so a single odd value never sinks the whole renderer.
+    raw string so a single odd value never sinks the whole renderer. A value
+    is decoded only if it round-trips: plain text such as ``0x1F`` or
+    ``1_000`` parses as a different number, and the prompt must show what the
+    request will use.
     """
     decoded: dict[str, Any] = {}
     for name, raw in arguments.items():
         try:
-            decoded[name] = ast.literal_eval(raw)
+            value = ast.literal_eval(raw)
         except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):  # noqa: PERF203 - per-value fallback is the whole point here
-            decoded[name] = raw
+            value = raw
+        decoded[name] = value if value is raw or repr(value) == raw else raw
     return decoded
 
 
