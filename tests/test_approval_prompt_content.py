@@ -284,11 +284,24 @@ def test_preview_line_renders_schwab_preview() -> None:
     assert orders._preview_line(PREVIEW) == PREVIEW_LINE
 
 
-@pytest.mark.parametrize("preview", [{}, None, "ok", {"orderValidationResult": {"type": "ACCEPTED"}}])
-def test_preview_line_marks_missing_fields(preview: Any) -> None:
-    assert orders._preview_line(preview) == (
+def test_preview_line_marks_missing_fields() -> None:
+    assert orders._preview_line({"orderValidationResult": {"type": "ACCEPTED"}}) == (
         "est. value not provided; commission and fees not provided; buying power after not provided; no warnings"
     )
+
+
+@pytest.mark.parametrize("preview", [{}, None, "ok", {"orderValidationResult": None}])
+def test_preview_line_without_a_validation_result_does_not_claim_no_warnings(preview: Any) -> None:
+    assert orders._preview_line(preview) == (
+        "est. value not provided; commission and fees not provided; buying power after not provided; "
+        "warnings not provided"
+    )
+
+
+def test_preview_line_shows_at_most_three_warnings() -> None:
+    preview = {"orderValidationResult": {"warns": ["one", "two", "three", "four", "five"]}}
+
+    assert orders._preview_line(preview).endswith("warnings: one | two | three | +2 more")
 
 
 def test_preview_line_falls_back_to_projected_commission() -> None:
@@ -389,6 +402,43 @@ def test_replace_prompt_carries_the_preview_line() -> None:
 def _signal_body(request: ApprovalRequest) -> str:
     renderer = signal_backend._TOOL_RENDERERS[request.tool_name]
     return renderer(signal_backend._decode_arguments(request.arguments), {"1234": "Brokerage"})
+
+
+@pytest.mark.parametrize("target", ["0x1F", "1_000", "0b101", "0o17"])
+def test_signal_replace_never_shows_a_reinterpreted_order_id(target: str) -> None:
+    request = ApprovalRequest(
+        id="a",
+        tool_name="replace_previewed_order",
+        request_id="r",
+        client_id=None,
+        arguments={
+            "original_tool": "preview_replacement_order",
+            "current_order": WORKING_SUMMARY,
+            "order_summary": "SINGLE BUY 5 AAPL EQUITY LIMIT @ $149.00",
+            "schwab_preview": PREVIEW_LINE,
+            "preview_id": "p",
+            "account_hash": ACCOUNT,
+            "target_order_id": target,
+            "order_id": target,
+        },
+    )
+    manager = signal_backend.SignalApprovalManager(
+        signal_backend.SignalApprovalSettings(
+            api_url="http://127.0.0.1:8080", account="+15555550100", approver_numbers=frozenset({"+15555550199"})
+        )
+    )
+
+    body = manager._render_body(request)
+
+    assert target in body
+    for reinterpreted in ("order 31 ", "order 1000 ", "order 5 ", "order 15 "):
+        assert reinterpreted not in body
+
+
+def test_signal_decoding_keeps_values_that_do_not_round_trip() -> None:
+    decoded = signal_backend._decode_arguments({"a": "0x1F", "b": "1000123", "c": "'text'", "d": "1_000"})
+
+    assert decoded == {"a": "0x1F", "b": 1000123, "c": "text", "d": "1_000"}
 
 
 def test_signal_cancel_shows_current_order() -> None:
