@@ -5,10 +5,11 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-from conftest import make_ctx, run, working_order
+from conftest import make_ctx, quotes_payload, run, working_order
 from mcp.server.mcpserver import MCPServer
 
 from schwab_mcp.approvals import ApprovalDecision
+from schwab_mcp.limits import quote_symbols
 from schwab_mcp.tools import orders
 from schwab_mcp.tools.utils import SchwabAPIError
 
@@ -500,6 +501,15 @@ class TestCancelOrder:
 
 class TestPlacePreviewedOrder:
     """Tests for the place_previewed_order tool (Phase 3)."""
+
+    @pytest.fixture(autouse=True)
+    def market_quotes(self, monkeypatch):
+        """These tests count call() invocations; serve quotes without one."""
+
+        async def quotes(_ctx: Any, order_spec: dict[str, Any]) -> dict[str, float]:
+            return dict.fromkeys(quote_symbols(order_spec), 1.0)
+
+        monkeypatch.setattr(orders, "_market_quotes", quotes)
 
     @pytest.fixture
     def account_hash(self):
@@ -1516,9 +1526,12 @@ class DummyPreviewClient:
     async def get_instruments(self, symbol: str, **kwargs: Any) -> Any:
         return DummyInstrumentsResponse(symbol=symbol)
 
+    async def get_quotes(self, symbols: list[str], **kwargs: Any) -> Any:
+        return quotes_payload(symbols)
+
     async def preview_order(self, *args: Any, **kwargs: Any) -> Any:
         self.captured = {"args": args, "kwargs": kwargs}
-        return {"orderId": 999, "orderStrategy": {}, "orderValidationResult": {}}
+        return {"orderId": 999, "orderStrategy": {"orderValue": 100.0}, "orderValidationResult": {}}
 
     async def place_order(self, *args: Any, **kwargs: Any) -> Any:
         """Capture a placement request and return an empty response."""
@@ -1688,6 +1701,7 @@ class TestPreviewReplacementOrder:
             "BUY 100 AAPL LIMIT @ $150.00",
             operation=orders.PreviewOperation.REPLACE_ORDER,
             target_order_id="order-9",
+            order_value=100.0,
         )
         calls: list[dict[str, Any]] = []
         approval_requests: list[Any] = []
@@ -1735,6 +1749,7 @@ class TestPreviewReplacementOrder:
             "BUY 1 AAPL MARKET",
             operation=orders.PreviewOperation.REPLACE_ORDER,
             target_order_id="order-9",
+            order_value=100.0,
         )
 
         client = ctx.orders
@@ -1776,6 +1791,7 @@ class TestPreviewReplacementOrder:
             "BUY 1 AAPL MARKET",
             operation=orders.PreviewOperation.REPLACE_ORDER,
             target_order_id="order-9",
+            order_value=100.0,
         )
 
         async def fake_run_approval(ctx, request):

@@ -15,7 +15,7 @@ from typing import Any, cast
 
 import httpx
 import pytest
-from conftest import make_ctx, run, working_order
+from conftest import make_ctx, quotes_payload, run, working_order
 
 from schwab_mcp.approvals import ApprovalDecision, ApprovalManager, ApprovalRequest, NoOpApprovalManager
 from schwab_mcp.approvals.base import format_outcome
@@ -73,6 +73,9 @@ class Client:
 
     async def get_instruments(self, symbol: str, **kwargs: Any) -> Any:
         return {"instruments": [{"symbol": symbol, "assetType": "EQUITY"}]}
+
+    async def get_quotes(self, symbols: list[str], **kwargs: Any) -> Any:
+        return quotes_payload(symbols)
 
     async def preview_order(self, *args: Any, **kwargs: Any) -> Any:
         return {}

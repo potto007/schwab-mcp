@@ -19,6 +19,7 @@ from schwab_mcp.approvals import (
     SignalApprovalManager,
     SignalApprovalSettings,
 )
+from schwab_mcp.limits import OrderLedger, TradingLimits, parse_symbol_allowlist
 from schwab_mcp.server import SchwabMCPServer, is_loopback_host, send_error_response
 
 APP_NAME = "schwab-mcp"
@@ -245,6 +246,16 @@ def _select_write_mode(
     return DiscordApprovalManager(settings), True
 
 
+def _describe_limits(limits: TradingLimits) -> str:
+    """One line with the effective trading limits, for the startup log."""
+    quantity = "none" if limits.max_order_quantity is None else str(limits.max_order_quantity)
+    symbols = "any" if limits.allowed_symbols is None else ", ".join(sorted(limits.allowed_symbols))
+    return (
+        f"max order value ${limits.max_order_value:,.2f}; max {limits.max_daily_orders} orders per day; "
+        f"max quantity {quantity}; allowed symbols {symbols}"
+    )
+
+
 @cli.command("server")
 @_common_options("Path to Schwab token file")
 @click.option(
@@ -351,6 +362,42 @@ def _select_write_mode(
     ),
 )
 @click.option(
+    "--max-order-value",
+    type=float,
+    default=None,
+    envvar="SCHWAB_MCP_MAX_ORDER_VALUE",
+    help=(
+        "Largest estimated order value in dollars a write may send (options count 100x the premium). "
+        "Required to enable write tools."
+    ),
+)
+@click.option(
+    "--max-daily-orders",
+    type=int,
+    default=None,
+    envvar="SCHWAB_MCP_MAX_DAILY_ORDERS",
+    help=(
+        "Most orders (placements and replacements) sent per US/Eastern day, counted across restarts. "
+        "Required to enable write tools."
+    ),
+)
+@click.option(
+    "--max-order-quantity",
+    type=int,
+    default=None,
+    envvar="SCHWAB_MCP_MAX_ORDER_QUANTITY",
+    help="Largest quantity (shares or contracts) on any order leg. Optional.",
+)
+@click.option(
+    "--allowed-symbol",
+    type=str,
+    multiple=True,
+    help=(
+        "Equity symbol or option underlying that orders may trade. Pass multiple times or set "
+        "SCHWAB_MCP_ALLOWED_SYMBOLS to a comma-separated list. Optional; without it any symbol is allowed."
+    ),
+)
+@click.option(
     "--json",
     "json_output",
     default=False,
@@ -410,6 +457,10 @@ def server(
     signal_approver: tuple[str, ...],
     signal_timeout: int,
     signal_account_name: tuple[str, ...],
+    max_order_value: float | None,
+    max_daily_orders: int | None,
+    max_order_quantity: int | None,
+    allowed_symbol: tuple[str, ...],
     no_technical_tools: bool,
     json_output: bool,
     use_http: bool,
@@ -570,6 +621,55 @@ def server(
         if jesus_take_the_wheel and backend_configured:
             click.echo("Warning: --jesus-take-the-wheel bypasses configured approvals.", err=True)
 
+        # Hand comma-split like the Signal lists: Click splits multiple=True
+        # env values on whitespace.
+        allowed_symbol_values: tuple[str, ...] = allowed_symbol
+        if not allowed_symbol_values:
+            env_symbols = os.getenv("SCHWAB_MCP_ALLOWED_SYMBOLS")
+            if env_symbols:
+                allowed_symbol_values = (env_symbols,)
+
+        trading_limits: TradingLimits | None = None
+        order_ledger: OrderLedger | None = None
+        if allow_write:
+            if max_order_value is None or max_daily_orders is None:
+                send_error_response(
+                    "Write tools require trading limits: set --max-order-value (SCHWAB_MCP_MAX_ORDER_VALUE) "
+                    "and --max-daily-orders (SCHWAB_MCP_MAX_DAILY_ORDERS).",
+                    code=400,
+                    details={
+                        "missing_max_order_value": max_order_value is None,
+                        "missing_max_daily_orders": max_daily_orders is None,
+                    },
+                )
+                return 1
+            try:
+                allowed_symbols = parse_symbol_allowlist(allowed_symbol_values)
+                if allowed_symbol_values and allowed_symbols is None:
+                    # A blank value (often an unset shell variable) must not
+                    # silently remove the allowlist.
+                    raise ValueError("the symbol allowlist was given but lists no symbols")
+                trading_limits = TradingLimits(
+                    max_order_value=max_order_value,
+                    max_daily_orders=max_daily_orders,
+                    max_order_quantity=max_order_quantity,
+                    allowed_symbols=allowed_symbols,
+                )
+                order_ledger = OrderLedger(tokens.order_ledger_path(APP_NAME))
+            except ValueError as exc:
+                send_error_response(f"Invalid trading limits: {exc}", code=400, details={"error": str(exc)})
+                return 1
+            click.echo(f"Trading limits: {_describe_limits(trading_limits)}", err=True)
+        elif any(
+            (
+                max_order_value is not None,
+                max_daily_orders is not None,
+                max_order_quantity is not None,
+                allowed_symbol_values,
+            )
+        ):
+            click.echo("Warning: trading limits are ignored because write tools are not enabled.", err=True)
+
         server = SchwabMCPServer(
             APP_NAME,
             client,
@@ -577,6 +677,8 @@ def server(
             allow_write=allow_write,
             enable_technical_tools=not no_technical_tools,
             use_json=json_output,
+            trading_limits=trading_limits,
+            order_ledger=order_ledger,
         )
         if use_http and not is_loopback_host(host):
             click.echo(

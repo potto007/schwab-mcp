@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Any, cast
 
 import pytest
-from conftest import make_ctx, run
+from conftest import make_ctx, quotes_payload, run
 
 from schwab_mcp.approvals.discord import DiscordApprovalManager
 from schwab_mcp.approvals.signal import _BODY_LIMIT, SignalApprovalManager, SignalApprovalSettings
@@ -31,9 +31,12 @@ class SummaryClient:
         self.calls.append("get_instruments")
         return {}
 
+    async def get_quotes(self, symbols: list[str], **kwargs: Any) -> Any:
+        return quotes_payload(symbols)
+
     async def preview_order(self, *args: Any, **kwargs: Any) -> Any:
         self.calls.append("preview_order")
-        return {}
+        return {"orderStrategy": {"orderValue": 100.0}}
 
 
 @pytest.fixture
@@ -262,12 +265,21 @@ def test_summary_refuses_values_it_cannot_show(mutate: Callable[[dict[str, Any]]
         orders._spec_summary(spec)
 
 
+async def passthrough(func: Any, *args: Any, **kwargs: Any) -> Any:
+    return await func(*args, **kwargs)
+
+
 def test_approval_request_carries_summary_of_placed_spec(monkeypatch: pytest.MonkeyPatch) -> None:
     """The approval request shows the summary of exactly the spec that is placed."""
     ctx = make_ctx(SummaryClient())
     spec = orders._prepare_oco_order(_OCO_FIRST, _OCO_SECOND)
     preview_id = ctx.previews.put(
-        ACCOUNT, spec, "preview_oco_order", orders._spec_summary(spec), operation=PreviewOperation.PLACE_ORDER
+        ACCOUNT,
+        spec,
+        "preview_oco_order",
+        orders._spec_summary(spec),
+        operation=PreviewOperation.PLACE_ORDER,
+        order_value=100.0,
     )
     seen: dict[str, Any] = {}
 
@@ -276,6 +288,7 @@ def test_approval_request_carries_summary_of_placed_spec(monkeypatch: pytest.Mon
         return orders.ApprovalDecision.DENIED
 
     monkeypatch.setattr(orders, "run_approval", approve)
+    monkeypatch.setattr(orders, "call", passthrough)
 
     with pytest.raises(PermissionError):
         run(orders.place_previewed_order(ctx, ACCOUNT, preview_id))

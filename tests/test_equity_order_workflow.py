@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 import pytest
-from conftest import make_ctx, run
+from conftest import make_ctx, quotes_payload, run
 
 from schwab_mcp.approvals import ApprovalDecision, ApprovalManager, ApprovalRequest
 from schwab_mcp.context import SchwabContext
@@ -31,6 +31,7 @@ EXPECTED_ORDER_SPEC: dict[str, Any] = {
 }
 
 PREVIEW_PAYLOAD = {
+    "orderStrategy": {"orderBalance": {"orderValue": 1234.56}},
     "orderValidationResult": {"type": "ACCEPTED"},
     "projectedOrder": {"orderType": "MARKET", "status": "WORKING"},
 }
@@ -82,6 +83,10 @@ class EquityOrdersClient:
             json={"instruments": [{"symbol": symbol, "assetType": "EQUITY"}]},
             request=request,
         )
+
+    async def get_quotes(self, symbols: list[str], **kwargs: Any) -> httpx.Response:
+        request = httpx.Request("GET", "https://api.schwabapi.com/marketdata/v1/quotes")
+        return httpx.Response(200, json=quotes_payload(symbols), request=request)
 
     async def preview_order(self, account_hash: str, order_spec: dict[str, Any]) -> httpx.Response:
         self.events.append("preview_submitted")
@@ -147,7 +152,7 @@ def assert_approval_request(
         "original_tool": "preview_equity_order",
         "order_summary": "SINGLE BUY 3 MSFT EQUITY MARKET session=NORMAL duration=DAY",
         "schwab_preview": (
-            "est. value not provided; commission and fees not provided; buying power after not provided; no warnings"
+            "est. value $1,234.56; commission and fees not provided; buying power after not provided; no warnings"
         ),
         "preview_id": preview_id,
         "account_hash": ACCOUNT_HASH,

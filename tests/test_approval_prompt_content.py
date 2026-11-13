@@ -9,7 +9,7 @@ from enum import Enum
 from typing import Any, cast
 
 import pytest
-from conftest import make_ctx, run
+from conftest import make_ctx, quotes_payload, run
 
 from schwab_mcp.approvals import ApprovalDecision, ApprovalManager, ApprovalRequest, signal as signal_backend
 from schwab_mcp.context import SchwabContext
@@ -114,6 +114,9 @@ class FakeClient:
         if self.order_error:
             raise SchwabAPIError(status_code=500, url="https://api.schwabapi.com/trader", body="boom")
         return self.order
+
+    async def get_quotes(self, symbols: list[str], **kwargs: Any) -> Any:
+        return quotes_payload(symbols)
 
     async def preview_order(self, *args: Any, **kwargs: Any) -> Any:
         self.calls.append("preview_order")

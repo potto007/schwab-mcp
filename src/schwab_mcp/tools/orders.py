@@ -32,7 +32,8 @@ from typing_extensions import TypedDict
 
 from schwab_mcp.approvals import ApprovalDecision, ApprovalRequest
 from schwab_mcp.context import SchwabContext
-from schwab_mcp.previews import PreviewOperation
+from schwab_mcp.limits import OrderLedger, OrderSlot, TradingLimits, check_order, quote_symbols
+from schwab_mcp.previews import PreviewEntry, PreviewOperation
 from schwab_mcp.tools._dates import parse_date
 from schwab_mcp.tools._protocols import ToolsClient
 from schwab_mcp.tools._registration import (
@@ -977,6 +978,38 @@ async def _run_order_write(
     return result
 
 
+async def _prepare_send(
+    ctx: SchwabContext,
+    request: ApprovalRequest,
+    account_hash: str,
+    limits: TradingLimits,
+    entry: PreviewEntry,
+    slot: OrderSlot,
+) -> None:
+    """Re-check an approved order against fresh quotes, then count it under the daily cap.
+
+    Prices can move while the reviewer decides, so the value cap is checked
+    again just before sending. If either step refuses, the reviewer is told
+    the order was not sent.
+    """
+    try:
+        quotes = await _market_quotes(ctx, entry.order_spec)
+        check_order(limits, entry.order_spec, entry.order_value, quotes)
+        # Counted before sending: a write that fails still used a slot.
+        slot.commit()
+    except asyncio.CancelledError:
+        report_outcome_soon(ctx, request, "not sent (the call was cancelled)", succeeded=False)
+        raise
+    except PermissionError as exc:
+        await _report_order_outcome(ctx, request, account_hash, f"not sent: {exc}", succeeded=False)
+        raise
+    except Exception as exc:
+        await _report_order_outcome(
+            ctx, request, account_hash, f"not sent: {type(exc).__name__}: {exc}", succeeded=False
+        )
+        raise
+
+
 async def _post_write_order_result(
     ctx: SchwabContext,
     account_hash: str,
@@ -1408,6 +1441,68 @@ def _preview_fees(preview: dict[str, Any], balance: dict[str, Any]) -> str | Non
     return _money(balance.get("projectedCommission"))
 
 
+def _trading_guard(ctx: SchwabContext) -> tuple[TradingLimits, OrderLedger]:
+    """Return the configured limits and ledger, or refuse the order write."""
+    limits = ctx.schwab.trading_limits
+    ledger = ctx.schwab.order_ledger
+    if limits is None or ledger is None:
+        raise PermissionError("Trading limits are not configured; order writes are disabled.")
+    return limits, ledger
+
+
+_QUOTE_PRICE_FIELDS = ("lastPrice", "mark", "askPrice", "bidPrice")
+
+
+def _quote_reference(entry: Any) -> float | None:
+    """Highest positive last, mark, ask or bid price in one Schwab quote entry."""
+    quote = entry.get("quote") if isinstance(entry, dict) else None
+    if not isinstance(quote, dict):
+        return None
+    prices = [
+        float(price)
+        for price in (quote.get(field) for field in _QUOTE_PRICE_FIELDS)
+        if not isinstance(price, bool) and isinstance(price, (int, float)) and math.isfinite(price) and price > 0
+    ]
+    return max(prices) if prices else None
+
+
+async def _market_quotes(ctx: SchwabContext, order_spec: dict[str, Any]) -> dict[str, float]:
+    """Reference prices for every leg (and short call underlying), so the value cap uses the market.
+
+    A quote that cannot be fetched refuses the order: without it a sell or a
+    stop far from the market could understate the order's value.
+    """
+    symbols = quote_symbols(order_spec)
+    if not symbols:
+        return {}
+    try:
+        payload = await call(ctx.quotes.get_quotes, symbols)
+    except (SchwabAPIError, ValueError, httpx.TransportError) as exc:
+        raise PermissionError(
+            f"Refusing order: market quotes are unavailable ({type(exc).__name__}), so its value cannot be bounded."
+        ) from exc
+    quotes: dict[str, float] = {}
+    if isinstance(payload, dict):
+        for symbol, entry in payload.items():
+            price = _quote_reference(entry)
+            if price is not None:
+                quotes[str(symbol)] = price
+    return quotes
+
+
+def _preview_order_value(preview: Any) -> float | None:
+    """Schwab's estimated order value from a preview, if it returned a usable one."""
+    payload: dict[str, Any] = preview if isinstance(preview, dict) else {}
+    strategy_raw = payload.get("orderStrategy")
+    strategy: dict[str, Any] = strategy_raw if isinstance(strategy_raw, dict) else {}
+    balance_raw = strategy.get("orderBalance")
+    balance: dict[str, Any] = balance_raw if isinstance(balance_raw, dict) else {}
+    for value in (balance.get("orderValue"), strategy.get("orderValue")):
+        if not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value):
+            return float(value)
+    return None
+
+
 def _preview_line(preview: Any) -> str:
     """Render Schwab's preview result for an approval prompt.
 
@@ -1466,6 +1561,7 @@ async def _finalize_preview(
         summary,
         operation=PreviewOperation.PLACE_ORDER,
         preview_line=_preview_line(preview),
+        order_value=_preview_order_value(preview),
     )
     return {
         "preview_id": preview_id,
@@ -2029,6 +2125,7 @@ async def preview_replacement_order(
         operation=PreviewOperation.REPLACE_ORDER,
         target_order_id=normalized_order_id,
         preview_line=_preview_line(preview),
+        order_value=_preview_order_value(preview),
     )
     return {
         "preview_id": preview_id,
@@ -2052,40 +2149,54 @@ async def place_previewed_order(
     {orderId, accountHash, note} payload if the post-placement status fetch
     fails or returns no data. *Write operation.*
     """
+    limits, ledger = _trading_guard(ctx)
+    peeked = ctx.previews.peek(preview_id, account_hash, operation=PreviewOperation.PLACE_ORDER)
+    # Checked again below; refusing here first saves a quote request.
     ensure_approval_capacity(ctx, "place_previewed_order")
-    entry = ctx.previews.pop(preview_id, account_hash, operation=PreviewOperation.PLACE_ORDER)
+    quotes = await _market_quotes(ctx, peeked.order_spec)
+    check_order(limits, peeked.order_spec, peeked.order_value, quotes)
+    # No await from here to run_approval's own cap check: checking the cap,
+    # taking a daily slot, consuming the preview and requesting approval
+    # happen together, and a refusal leaves the preview usable.
+    ensure_approval_capacity(ctx, "place_previewed_order")
+    slot = ledger.reserve(limits.max_daily_orders)
+    try:
+        entry = ctx.previews.pop(preview_id, account_hash, operation=PreviewOperation.PLACE_ORDER)
 
-    request = ApprovalRequest(
-        id=str(uuid.uuid4()),
-        tool_name="place_previewed_order",
-        request_id=ctx.request_id,
-        client_id=ctx.client_id,
-        arguments={
-            "original_tool": entry.tool_name,
-            "order_summary": entry.summary,
-            "schwab_preview": entry.preview_line or "not available",
-            "preview_id": preview_id,
-            "account_hash": account_hash,
-        },
-    )
-
-    decision = await run_approval(ctx, request)
-    if decision is ApprovalDecision.APPROVED:
-
-        async def write() -> JSONType:
-            return await call(
-                ctx.orders.place_order,
-                account_hash=account_hash,
-                order_spec=entry.order_spec,
-                response_handler=_order_response_handler(ctx, account_hash),
-            )
-
-        async def finish(placed: JSONType) -> JSONType:
-            return await _post_write_order_result(ctx, account_hash, placed, "Order placed; status fetch failed")
-
-        return await _run_order_write(
-            ctx, request, account_hash, verb="place", action="placed", write=write, finish=finish
+        request = ApprovalRequest(
+            id=str(uuid.uuid4()),
+            tool_name="place_previewed_order",
+            request_id=ctx.request_id,
+            client_id=ctx.client_id,
+            arguments={
+                "original_tool": entry.tool_name,
+                "order_summary": entry.summary,
+                "schwab_preview": entry.preview_line or "not available",
+                "preview_id": preview_id,
+                "account_hash": account_hash,
+            },
         )
+
+        decision = await run_approval(ctx, request)
+        if decision is ApprovalDecision.APPROVED:
+            await _prepare_send(ctx, request, account_hash, limits, entry, slot)
+
+            async def write() -> JSONType:
+                return await call(
+                    ctx.orders.place_order,
+                    account_hash=account_hash,
+                    order_spec=entry.order_spec,
+                    response_handler=_order_response_handler(ctx, account_hash),
+                )
+
+            async def finish(placed: JSONType) -> JSONType:
+                return await _post_write_order_result(ctx, account_hash, placed, "Order placed; status fetch failed")
+
+            return await _run_order_write(
+                ctx, request, account_hash, verb="place", action="placed", write=write, finish=finish
+            )
+    finally:
+        slot.release()
 
     message = (
         "Order placement denied by reviewer."
@@ -2109,57 +2220,70 @@ async def replace_previewed_order(
     Approval is requested only after the account, operation, and target order
     binding have been validated.
     """
+    limits, ledger = _trading_guard(ctx)
     peeked = ctx.previews.peek(preview_id, account_hash, operation=PreviewOperation.REPLACE_ORDER)
     target_order_id = peeked.target_order_id.strip() if peeked.target_order_id is not None else None
     if not target_order_id:
         raise ValueError("Replacement preview is missing its target order id.")
+    # Checked again below; refusing here first saves Schwab requests.
+    ensure_approval_capacity(ctx, "replace_previewed_order")
+    quotes = await _market_quotes(ctx, peeked.order_spec)
+    check_order(limits, peeked.order_spec, peeked.order_value, quotes)
     current_order = await _fetch_current_order(ctx, account_hash, target_order_id, "replace")
     # No await from here to run_approval's own cap check: checking the cap,
-    # consuming the preview and requesting approval happen together.
+    # taking a daily slot, consuming the preview and requesting approval
+    # happen together.
     ensure_approval_capacity(ctx, "replace_previewed_order")
-    entry = ctx.previews.pop(preview_id, account_hash, operation=PreviewOperation.REPLACE_ORDER)
+    slot = ledger.reserve(limits.max_daily_orders)
+    try:
+        entry = ctx.previews.pop(preview_id, account_hash, operation=PreviewOperation.REPLACE_ORDER)
 
-    request = ApprovalRequest(
-        id=str(uuid.uuid4()),
-        tool_name="replace_previewed_order",
-        request_id=ctx.request_id,
-        client_id=ctx.client_id,
-        arguments={
-            "original_tool": entry.tool_name,
-            "current_order": current_order,
-            "order_summary": entry.summary,
-            "schwab_preview": entry.preview_line or "not available",
-            "preview_id": preview_id,
-            "account_hash": account_hash,
-            "target_order_id": target_order_id,
-            "order_id": target_order_id,
-        },
-    )
-
-    decision = await run_approval(ctx, request)
-    if decision is ApprovalDecision.APPROVED:
-
-        async def write() -> JSONType:
-            return await call(
-                ctx.orders.replace_order,
-                account_hash=account_hash,
-                order_id=target_order_id,
-                order_spec=entry.order_spec,
-                response_handler=_order_response_handler(ctx, account_hash),
-            )
-
-        async def finish(replaced: JSONType) -> JSONType:
-            return await _post_write_order_result(ctx, account_hash, replaced, "Order replaced; status fetch failed")
-
-        return await _run_order_write(
-            ctx,
-            request,
-            account_hash,
-            verb="replace",
-            action=f"replaced order {target_order_id}",
-            write=write,
-            finish=finish,
+        request = ApprovalRequest(
+            id=str(uuid.uuid4()),
+            tool_name="replace_previewed_order",
+            request_id=ctx.request_id,
+            client_id=ctx.client_id,
+            arguments={
+                "original_tool": entry.tool_name,
+                "current_order": current_order,
+                "order_summary": entry.summary,
+                "schwab_preview": entry.preview_line or "not available",
+                "preview_id": preview_id,
+                "account_hash": account_hash,
+                "target_order_id": target_order_id,
+                "order_id": target_order_id,
+            },
         )
+
+        decision = await run_approval(ctx, request)
+        if decision is ApprovalDecision.APPROVED:
+            await _prepare_send(ctx, request, account_hash, limits, entry, slot)
+
+            async def write() -> JSONType:
+                return await call(
+                    ctx.orders.replace_order,
+                    account_hash=account_hash,
+                    order_id=target_order_id,
+                    order_spec=entry.order_spec,
+                    response_handler=_order_response_handler(ctx, account_hash),
+                )
+
+            async def finish(replaced: JSONType) -> JSONType:
+                return await _post_write_order_result(
+                    ctx, account_hash, replaced, "Order replaced; status fetch failed"
+                )
+
+            return await _run_order_write(
+                ctx,
+                request,
+                account_hash,
+                verb="replace",
+                action=f"replaced order {target_order_id}",
+                write=write,
+                finish=finish,
+            )
+    finally:
+        slot.release()
 
     message = (
         "Order replacement denied by reviewer."

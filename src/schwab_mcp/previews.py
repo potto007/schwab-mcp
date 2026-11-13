@@ -32,6 +32,8 @@ class PreviewEntry:
     operation: PreviewOperation
     target_order_id: str | None
     preview_line: str | None = None
+    order_value: float | None = None
+    """Schwab's estimated order value from the preview, if it returned one."""
 
 
 class PreviewStore:
@@ -71,6 +73,7 @@ class PreviewStore:
         operation: PreviewOperation | str,
         target_order_id: str | None = None,
         preview_line: str | None = None,
+        order_value: float | None = None,
     ) -> str:
         """Store a preview entry and return its 16-char hex id.
 
@@ -100,6 +103,7 @@ class PreviewStore:
             operation=normalized_operation,
             target_order_id=normalized_target_order_id,
             preview_line=preview_line,
+            order_value=order_value,
         )
         return preview_id
 
