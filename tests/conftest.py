@@ -306,3 +306,35 @@ def place_order_client_factory(order_response_factory):
         return DummyPlaceOrderClient(order_response=response)
 
     return factory
+
+
+def working_order(
+    order_id: Any = 1,
+    *,
+    symbol: str = "AAPL",
+    quantity: int = 1,
+    instruction: str = "BUY",
+    asset_type: str = "EQUITY",
+) -> dict[str, Any]:
+    """A cancelable, editable WORKING order shaped like Schwab's get_order payload."""
+    return {
+        "orderId": order_id,
+        "status": "WORKING",
+        "orderType": "LIMIT",
+        "price": 1.0,
+        "session": "NORMAL",
+        "duration": "DAY",
+        "orderStrategyType": "SINGLE",
+        "quantity": quantity,
+        "filledQuantity": 0,
+        "remainingQuantity": quantity,
+        "cancelable": True,
+        "editable": True,
+        "orderLegCollection": [
+            {
+                "instruction": instruction,
+                "quantity": quantity,
+                "instrument": {"symbol": symbol, "assetType": asset_type},
+            }
+        ],
+    }

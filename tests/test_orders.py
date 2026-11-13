@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-from conftest import make_ctx, run
+from conftest import make_ctx, run, working_order
 from mcp.server.mcpserver import MCPServer
 
 from schwab_mcp.approvals import ApprovalDecision
@@ -393,6 +393,8 @@ class TestCancelOrder:
         async def fake_call(func, *args, **kwargs):
             calls.append({"func": func, "kwargs": kwargs})
             if len(calls) == 1:
+                return working_order("order456")  # target fetched before approval
+            if len(calls) == 2:
                 return None  # cancel_order response
             return sample_order  # get_order response
 
@@ -409,13 +411,15 @@ class TestCancelOrder:
         ctx = make_ctx(client)
         result = run(orders.cancel_order(ctx, "hash123", "order456"))
 
-        assert len(calls) == 2
-        assert calls[0]["func"] == client.cancel_order
-        assert calls[0]["kwargs"]["account_hash"] == "hash123"
-        assert calls[0]["kwargs"]["order_id"] == "order456"
-        assert calls[1]["func"] == client.get_order
+        assert len(calls) == 3
+        assert calls[0]["func"] == client.get_order
+        assert calls[0]["kwargs"] == {"order_id": "order456", "account_hash": "hash123"}
+        assert calls[1]["func"] == client.cancel_order
         assert calls[1]["kwargs"]["account_hash"] == "hash123"
         assert calls[1]["kwargs"]["order_id"] == "order456"
+        assert calls[2]["func"] == client.get_order
+        assert calls[2]["kwargs"]["account_hash"] == "hash123"
+        assert calls[2]["kwargs"]["order_id"] == "order456"
         # sample_order only contains compact fields, so pruning is a no-op.
         assert result == sample_order
 
@@ -439,6 +443,8 @@ class TestCancelOrder:
             """Return the cancel response and the configured status response."""
             calls.append(func)
             if len(calls) == 1:
+                return working_order("order456")  # target fetched before approval
+            if len(calls) == 2:
                 return None
             if isinstance(status_fetch, Exception):
                 raise status_fetch
@@ -468,6 +474,8 @@ class TestCancelOrder:
 
         async def fake_call(func, *args, **kwargs):
             calls.append(func)
+            if len(calls) == 1:
+                return working_order("order456")  # target fetched before approval
             raise SchwabAPIError(status_code=400, url="/cancel", body="bad request")
 
         monkeypatch.setattr(orders, "call", fake_call)
@@ -485,8 +493,9 @@ class TestCancelOrder:
         with pytest.raises(SchwabAPIError):
             run(orders.cancel_order(ctx, "hash123", "order456"))
 
-        # Only cancel_order was called, not get_order
-        assert len(calls) == 1
+        # The target was read before approval; after the failed cancel there
+        # is no status fetch.
+        assert calls == [client.get_order, client.cancel_order]
 
 
 class TestPlacePreviewedOrder:
@@ -1684,9 +1693,11 @@ class TestPreviewReplacementOrder:
         approval_requests: list[Any] = []
 
         async def fake_call(func, *args, **kwargs):
-            """Return replacement submission and post-write status."""
+            """Return the target, the replacement submission and post-write status."""
             calls.append({"func": func, "kwargs": kwargs})
-            return {"orderId": "new-order-10"} if len(calls) == 1 else {"orderId": "new-order-10", "status": "WORKING"}
+            if len(calls) == 1:
+                return working_order("order-9")
+            return {"orderId": "new-order-10"} if len(calls) == 2 else {"orderId": "new-order-10", "status": "WORKING"}
 
         async def fake_run_approval(ctx, request):
             """Approve and capture the human-readable replacement request."""
@@ -1699,14 +1710,17 @@ class TestPreviewReplacementOrder:
         result = run(orders.replace_previewed_order(ctx, "acc123", preview_id))
 
         assert result == {"orderId": "new-order-10", "status": "WORKING"}
-        assert calls[0]["func"] == client.replace_order
-        assert calls[0]["kwargs"]["account_hash"] == "acc123"
-        assert calls[0]["kwargs"]["order_id"] == "order-9"
-        assert calls[0]["kwargs"]["order_spec"] == spec
+        assert calls[0]["func"] == client.get_order
+        assert calls[0]["kwargs"] == {"order_id": "order-9", "account_hash": "acc123"}
+        assert calls[1]["func"] == client.replace_order
+        assert calls[1]["kwargs"]["account_hash"] == "acc123"
+        assert calls[1]["kwargs"]["order_id"] == "order-9"
+        assert calls[1]["kwargs"]["order_spec"] == spec
         request = approval_requests[0]
         assert request.tool_name == "replace_previewed_order"
         assert request.arguments["target_order_id"] == "order-9"
         assert request.arguments["order_summary"] == "BUY 100 AAPL LIMIT @ $150.00"
+        assert request.arguments["current_order"].startswith("SINGLE BUY 1 AAPL EQUITY LIMIT")
 
     def test_replacement_returns_fallback_when_status_fetch_fails(self, monkeypatch):
         """A successful replacement remains visible when status lookup fails."""
@@ -1723,10 +1737,14 @@ class TestPreviewReplacementOrder:
             target_order_id="order-9",
         )
 
+        client = ctx.orders
+
         async def fake_call(func, *args, **kwargs):
-            """Return a replacement ID and fail its status lookup."""
+            """Return the target, a replacement ID, and fail its status lookup."""
             if kwargs.get("order_id") == "new-order-10":
                 raise SchwabAPIError(status_code=404, url="/order", body="not found")
+            if func == client.get_order:
+                return working_order("order-9")
             return {"orderId": "new-order-10"}
 
         async def fake_run_approval(ctx, request):
@@ -1764,8 +1782,12 @@ class TestPreviewReplacementOrder:
             """Return the requested approval failure decision."""
             return ApprovalDecision[decision]
 
-        async def fail_call(*args, **kwargs):
-            """Fail if replacement attempts to call Schwab."""
+        client = ctx.orders
+
+        async def fail_call(func, *args, **kwargs):
+            """Serve the target lookup; fail if the replacement write runs."""
+            if func == client.get_order:
+                return working_order("order-9")
             raise AssertionError("replacement write must not run")
 
         monkeypatch.setattr(orders, "run_approval", fake_run_approval)

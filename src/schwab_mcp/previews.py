@@ -31,6 +31,7 @@ class PreviewEntry:
     created_at: float
     operation: PreviewOperation
     target_order_id: str | None
+    preview_line: str | None = None
 
 
 class PreviewStore:
@@ -69,6 +70,7 @@ class PreviewStore:
         *,
         operation: PreviewOperation | str,
         target_order_id: str | None = None,
+        preview_line: str | None = None,
     ) -> str:
         """Store a preview entry and return its 16-char hex id.
 
@@ -97,8 +99,23 @@ class PreviewStore:
             created_at=time.monotonic(),
             operation=normalized_operation,
             target_order_id=normalized_target_order_id,
+            preview_line=preview_line,
         )
         return preview_id
+
+    def peek(
+        self,
+        preview_id: str,
+        account_hash: str,
+        *,
+        operation: PreviewOperation | str,
+    ) -> PreviewEntry:
+        """Return a preview entry without consuming it, validated like :meth:`pop`.
+
+        Lets a caller do async checks before committing to use the preview,
+        then :meth:`pop` it with no await in between.
+        """
+        return self._valid_entry(preview_id, account_hash, operation)
 
     def pop(
         self,
@@ -113,6 +130,16 @@ class PreviewStore:
             ValueError: If the id is unknown or the entry has expired.
             ValueError: If the account_hash does not match the stored entry.
         """
+        entry = self._valid_entry(preview_id, account_hash, operation)
+        del self._entries[preview_id]
+        return entry
+
+    def _valid_entry(
+        self,
+        preview_id: str,
+        account_hash: str,
+        operation: PreviewOperation | str,
+    ) -> PreviewEntry:
         normalized_operation = self._coerce_operation(operation)
         entry = self._entries.get(preview_id)
         if entry is None or entry.created_at + self._ttl < time.monotonic():
@@ -122,7 +149,6 @@ class PreviewStore:
             raise ValueError("Account hash mismatch: preview was created for a different account.")
         if entry.operation is not normalized_operation:
             raise ValueError(f"Preview operation mismatch: expected {normalized_operation.value}.")
-        del self._entries[preview_id]
         return entry
 
 

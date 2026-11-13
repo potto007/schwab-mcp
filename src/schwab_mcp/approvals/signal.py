@@ -359,14 +359,18 @@ def _decode_arguments(arguments: Mapping[str, str]) -> dict[str, Any]:
     truncates at 256 chars; ``ast.literal_eval`` reverses the repr. Tools that
     build their own request (``place_previewed_order`` in `tools/orders.py`)
     pass plain strings, and truncated reprs don't parse; both fall back to the
-    raw string so a single odd value never sinks the whole renderer.
+    raw string so a single odd value never sinks the whole renderer. A value
+    is decoded only if it round-trips: plain text such as ``0x1F`` or
+    ``1_000`` parses as a different number, and the prompt must show what the
+    request will use.
     """
     decoded: dict[str, Any] = {}
     for name, raw in arguments.items():
         try:
-            decoded[name] = ast.literal_eval(raw)
+            value = ast.literal_eval(raw)
         except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):  # noqa: PERF203 - per-value fallback is the whole point here
-            decoded[name] = raw
+            value = raw
+        decoded[name] = value if value is raw or repr(value) == raw else raw
     return decoded
 
 
@@ -406,14 +410,32 @@ def _account_label(account_value: Any, account_names: Mapping[str, str]) -> str:
     return f"account …{last4}"
 
 
-def _render_cancel_order(args: Mapping[str, Any], account_names: Mapping[str, str]) -> str:
-    order_id = args.get("order_id")
-    # Like account_hash, order_id goes into the request path verbatim; only
-    # summarize plain ASCII digits so the prompt cannot misrepresent the
-    # target. Anything else goes to the verbose dump via the raised error.
-    if order_id is not None and not (isinstance(order_id, str) and order_id.isascii() and order_id.isdigit()):
+def _safe_order_id(order_id: Any) -> str | None:
+    """Return the order id as text if a summary can show it faithfully.
+
+    Like account_hash, order_id goes into the request path verbatim; only
+    summarize plain ASCII digits so the prompt cannot misrepresent the
+    target. Anything else goes to the verbose dump via the raised error.
+    """
+    if order_id is None:
+        return None
+    text = str(order_id) if isinstance(order_id, int) and not isinstance(order_id, bool) else order_id
+    if not (isinstance(text, str) and text.isascii() and text.isdigit()):
         raise ValueError(f"order_id cannot be summarized faithfully: {order_id!r}")
+    return text
+
+
+def _preview_suffix(args: Mapping[str, Any]) -> str:
+    preview = args.get("schwab_preview")
+    return f"\nSchwab preview: {preview}" if preview else ""
+
+
+def _render_cancel_order(args: Mapping[str, Any], account_names: Mapping[str, str]) -> str:
+    order_id = _safe_order_id(args.get("order_id"))
     account = _account_label(args.get("account_hash"), account_names)
+    current = args.get("current_order")
+    if current:
+        return f"cancel order {order_id or '?'} in {account}:\n{current}"
     return f"cancel order {order_id or '?'} in {account}."
 
 
@@ -423,11 +445,24 @@ def _render_place_previewed_order(args: Mapping[str, Any], account_names: Mappin
     account = _account_label(args.get("account_hash"), account_names)
     # The summary is one order per line (composite orders span several), so
     # it goes below the header rather than mid-sentence.
-    return f"place a previewed order in {account} (previewed via {original_tool}):\n{summary}"
+    return f"place a previewed order in {account} (previewed via {original_tool}):\n{summary}" + _preview_suffix(args)
+
+
+def _render_replace_previewed_order(args: Mapping[str, Any], account_names: Mapping[str, str]) -> str:
+    order_id = _safe_order_id(args.get("target_order_id"))
+    original_tool = args.get("original_tool") or "a preview tool"
+    account = _account_label(args.get("account_hash"), account_names)
+    current = args.get("current_order") or "?"
+    summary = args.get("order_summary") or "?"
+    return (
+        f"replace order {order_id or '?'} in {account} (previewed via {original_tool}):\n"
+        f"current:\n{current}\nnew:\n{summary}" + _preview_suffix(args)
+    )
 
 
 _TOOL_RENDERERS: Mapping[str, Any] = {
     "place_previewed_order": _render_place_previewed_order,
+    "replace_previewed_order": _render_replace_previewed_order,
     "cancel_order": _render_cancel_order,
 }
 

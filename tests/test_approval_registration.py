@@ -39,7 +39,11 @@ class FakeSchwabOrders:
                 "quantity": 2,
                 "filledQuantity": 0,
                 "remainingQuantity": 2,
+                "cancelable": True,
                 "internalNote": "not returned to callers",
+                "orderLegCollection": [
+                    {"instruction": "SELL", "quantity": 2, "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}
+                ],
             }
         }
         self.cancel_mutations: list[tuple[str, str]] = []
@@ -98,6 +102,7 @@ def assert_cancel_request(approvals: FixedApprovalManager) -> None:
     assert request.arguments == {
         "account_hash": repr(ACCOUNT_HASH),
         "order_id": repr(ORDER_ID),
+        "current_order": "SELL 2 AAPL EQUITY status=WORKING filledQuantity=0 remainingQuantity=2",
     }
 
 
@@ -147,4 +152,5 @@ def test_registered_cancel_executes_and_returns_updated_order_when_approved() ->
         "quantity": 2,
         "filledQuantity": 0,
         "remainingQuantity": 2,
+        "legs": [{"instruction": "SELL", "quantity": 2, "symbol": "AAPL"}],
     }

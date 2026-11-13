@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import httpx
 import pytest
-from conftest import make_ctx, run
+from conftest import make_ctx, run, working_order
 from schwab.client import AsyncClient as SchwabAsyncClient
 
 from schwab_mcp.approvals import ApprovalDecision, ApprovalManager, ApprovalRequest
@@ -41,6 +41,10 @@ class ReplacementClient:
         return {"orderId": "placed-10"}
 
     async def get_order(self, **kwargs: Any) -> dict[str, Any]:
+        # The target is readable before the write; the post-write status
+        # fetch fails, so callers see the fallback payload.
+        if self.replacement_calls == 0 and self.place_calls == 0:
+            return working_order(kwargs.get("order_id"))
         raise httpx.ConnectError("status unavailable")
 
 
@@ -467,7 +471,7 @@ def test_valid_identifiers_are_preserved_in_schwab_http_requests() -> None:
             return httpx.Response(200, json={"instruments": [{"assetType": "EQUITY"}]}, request=request)
         if request.method == "POST":
             return httpx.Response(200, json={"previewed": True}, request=request)
-        return httpx.Response(200, json={"orderId": "order_123", "status": "WORKING"}, request=request)
+        return httpx.Response(200, json=working_order("order_123"), request=request)
 
     async def scenario() -> None:
         client, session = mock_schwab_client(httpx.MockTransport(handler))
@@ -489,6 +493,10 @@ def test_valid_identifiers_are_preserved_in_schwab_http_requests() -> None:
     assert approval_manager.requests[0].arguments == {
         "account_hash": "'HASH_123-abc'",
         "order_id": "'order_123'",
+        "current_order": (
+            "SINGLE BUY 1 AAPL EQUITY LIMIT @ $1.0 session=NORMAL duration=DAY "
+            "status=WORKING filledQuantity=0 remainingQuantity=1"
+        ),
     }
 
 

@@ -7,7 +7,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from conftest import make_ctx, run
+from conftest import make_ctx, run, working_order
 
 from schwab_mcp.approvals import ApprovalDecision, ApprovalManager, ApprovalRequest
 from schwab_mcp.approvals.discord import DiscordApprovalManager, DiscordApprovalSettings
@@ -172,8 +172,18 @@ def test_verbose_accounts_keep_full_number(account_ctx: Any) -> None:
         ("replace_previewed_order", "REPLACE_ORDER", "order-9"),
     ],
 )
-def test_cap_refusal_keeps_preview_usable(tool: str, operation: str, target: str | None) -> None:
-    ctx = make_ctx(object())
+def test_cap_refusal_keeps_preview_usable(
+    tool: str, operation: str, target: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class TargetClient:
+        async def get_order(self, *args: Any, **kwargs: Any) -> Any:
+            return working_order(target)
+
+    async def passthrough(func: Any, *args: Any, **kwargs: Any) -> Any:
+        return await func(*args, **kwargs)
+
+    monkeypatch.setattr(orders, "call", passthrough)
+    ctx = make_ctx(TargetClient())
     ctx.schwab.approval_manager = GatedApprovals()
     account_hash = "A" * 64
     preview_id = ctx.previews.put(
