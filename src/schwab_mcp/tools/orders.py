@@ -1,5 +1,6 @@
 """Order placement, management, and preview tools for the Schwab MCP server."""
 
+import asyncio
 import logging
 import math
 import re
@@ -35,11 +36,12 @@ from schwab_mcp.previews import PreviewOperation
 from schwab_mcp.tools._dates import parse_date
 from schwab_mcp.tools._protocols import ToolsClient
 from schwab_mcp.tools._registration import (
-    describe_write_error,
     ensure_approval_capacity,
     register_tool,
     report_outcome,
+    report_outcome_soon,
     run_approval,
+    write_failure_outcome,
 )
 from schwab_mcp.tools.order_helpers import (
     equity_buy_limit,
@@ -890,6 +892,11 @@ def _write_outcome(action: str, result: JSONType) -> str:
     return line
 
 
+def _shorten_account(outcome: str, account_hash: str) -> str:
+    # Error text can echo the request URL; show the account the way prompts do.
+    return outcome.replace(account_hash, f"…{account_hash[-4:]}") if account_hash else outcome
+
+
 async def _report_order_outcome(
     ctx: SchwabContext,
     request: ApprovalRequest,
@@ -898,10 +905,7 @@ async def _report_order_outcome(
     *,
     succeeded: bool,
 ) -> None:
-    # Error text can echo the request URL; show the account the way prompts do.
-    if account_hash:
-        outcome = outcome.replace(account_hash, f"…{account_hash[-4:]}")
-    await report_outcome(ctx, request, outcome, succeeded=succeeded)
+    await report_outcome(ctx, request, _shorten_account(outcome, account_hash), succeeded=succeeded)
 
 
 async def _run_order_write(
@@ -917,19 +921,32 @@ async def _run_order_write(
     """Run an approved order write, then report what happened to the reviewer.
 
     ``write`` sends the order to Schwab; ``finish`` fetches its status. A
-    failure in ``write`` is reported as a failure. Once ``write`` succeeded
-    the order exists, so a failure in ``finish`` is still reported as a
-    completed write with an unconfirmed status.
+    Schwab refusal (HTTP 4xx) in ``write`` is reported as a failure; any other
+    error, or a cancelled call, may come after Schwab accepted the order, so
+    it is reported as an unknown outcome. Once ``write`` succeeded the order
+    exists, so a failure in ``finish`` is still reported as a completed write
+    with an unconfirmed status.
     """
     try:
         written = await write()
-    except Exception as exc:
-        await _report_order_outcome(
-            ctx, request, account_hash, f"{verb} failed: {describe_write_error(exc)}", succeeded=False
+    except asyncio.CancelledError:
+        report_outcome_soon(
+            ctx,
+            request,
+            _shorten_account(f"{verb} outcome unknown (the call was cancelled); check Schwab", account_hash),
+            succeeded=False,
         )
+        raise
+    except Exception as exc:
+        await _report_order_outcome(ctx, request, account_hash, f"{verb} {write_failure_outcome(exc)}", succeeded=False)
         raise
     try:
         result = await finish(written)
+    except asyncio.CancelledError:
+        report_outcome_soon(
+            ctx, request, _shorten_account(_write_outcome(action, written), account_hash), succeeded=True
+        )
+        raise
     except Exception:
         await _report_order_outcome(ctx, request, account_hash, _write_outcome(action, written), succeeded=True)
         raise

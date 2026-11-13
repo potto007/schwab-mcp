@@ -23,7 +23,7 @@ compact defaults with `verbose=True` escape hatches where response size matters.
   so a refusal leaves it usable. After an approved write, `report_outcome()`
   sends the reviewer one outcome line through the approval manager (bounded
   by `_OUTCOME_REPORT_TIMEOUT_SECONDS`; failures are logged, never raised).
-  Wrapped write tools report `completed` or `failed: <error>`;
+  Wrapped write tools report `completed`, `failed: <error>` for a Schwab 4xx, or `outcome unknown (<error>); check Schwab` for anything else (`write_failure_outcome()`); a cancelled call is reported from its own task (`report_outcome_soon()`);
   `describe_write_error()` shows a Schwab error's status and body, not its
   URL.
 - `_protocols.py` defines Protocol facades for each Schwab client namespace
