@@ -246,6 +246,35 @@ def test_a_cancelled_write_is_still_reported() -> None:
     assert succeeded is False
 
 
+def test_a_report_in_flight_survives_the_caller_being_cancelled() -> None:
+    reporting = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowApprovals(OutcomeApprovals):
+        async def report_outcome(self, request: ApprovalRequest, outcome: str, *, succeeded: bool) -> None:
+            reporting.set()
+            await release.wait()
+            await super().report_outcome(request, outcome, succeeded=succeeded)
+
+    approvals = SlowApprovals()
+    ctx = _ctx(Client([]), approvals)
+    request = ApprovalRequest(id="r1", tool_name="place_previewed_order", request_id="q", client_id=None, arguments={})
+
+    async def scenario() -> None:
+        caller = asyncio.create_task(_registration.report_outcome(ctx, request, "not sent: refused", succeeded=False))
+        await reporting.wait()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        release.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    run(scenario())
+
+    assert approvals.outcomes == [("r1", "not sent: refused", False)]
+
+
 @pytest.mark.parametrize(
     ("decision", "error"),
     [(ApprovalDecision.DENIED, PermissionError), (ApprovalDecision.EXPIRED, TimeoutError)],

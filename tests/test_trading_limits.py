@@ -914,3 +914,38 @@ def test_a_cancelled_send_time_check_reports_not_sent(monkeypatch: pytest.Monkey
     assert client.calls == []
     assert approvals.outcomes == [("not sent (the call was cancelled)", False)]
     ledger.reserve(1)
+
+
+def test_a_not_sent_report_survives_cancellation() -> None:
+    reporting = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowRecorder(OutcomeRecorder):
+        async def report_outcome(self, request: ApprovalRequest, outcome: str, *, succeeded: bool) -> None:
+            reporting.set()
+            await release.wait()
+            await super().report_outcome(request, outcome, succeeded=succeeded)
+
+    client, approvals = Client(quotes={"AAPL": 1.0}), SlowRecorder()
+    ledger = OrderLedger(None)
+    ctx = _ctx(client, approvals, limits=TradingLimits(max_order_value=5_000.0, max_daily_orders=1), ledger=ledger)
+    preview_id = _preview(ctx, quantity=10, price=150.0)
+    client.quotes_after_first = {"AAPL": 600.0}
+
+    async def scenario() -> None:
+        task = asyncio.create_task(orders.place_previewed_order(ctx, ACCOUNT, preview_id))
+        await reporting.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    run(scenario())
+
+    assert client.calls == []
+    [(outcome, succeeded)] = approvals.outcomes
+    assert outcome.startswith("not sent: Refusing order: estimated value $6,000.00 exceeds")
+    assert succeeded is False
+    ledger.reserve(1)
