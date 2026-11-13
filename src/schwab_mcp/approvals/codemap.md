@@ -9,7 +9,7 @@ Provides the approval abstraction and the Discord- and Signal-backed implementat
 - `base.py` owns the stable contract:
   - `ApprovalDecision` enum: `APPROVED`, `DENIED`, `EXPIRED`.
   - `ApprovalRequest`: frozen dataclass carrying approval id, tool name, MCP request/client ids, and stringified arguments shown to reviewers.
-  - `ApprovalManager`: async lifecycle hooks (`start()`, `stop()`) plus abstract `require()`.
+  - `ApprovalManager`: async lifecycle hooks (`start()`, `stop()`), abstract `require()`, and `report_outcome()` (default no-op) that tells the reviewer what an approved write did.
   - `NoOpApprovalManager`: always approves, used when writes are disabled or explicitly bypassed.
 - `discord.py` implements `DiscordApprovalManager` around `discord.py`:
   - `DiscordApprovalSettings` stores token, channel id, allowed approver ids, timeout, and optional account names keyed by the last four characters of the account hash.
@@ -19,6 +19,7 @@ Provides the approval abstraction and the Discord- and Signal-backed implementat
 - The Discord manager requires at least one explicit approver id; unauthorized reactions are ignored and best-effort removed. Embeds label the client-supplied client id `Client ID (unverified)` and show it and the request id as inline code (control characters and backticks removed, long values shortened); `tools._registration.run_approval()` caps concurrent pending approvals at 3.
 - `signal.py` implements `SignalApprovalManager` against a local bbernhard/signal-cli-rest-api daemon (which must run in `json-rpc`/`json-rpc-native` mode so `/v1/receive` is a websocket): approval requests are sent as Signal messages, decisions arrive as quoted replies ("ok"/"no") from authorized numbers quoting the bot's own message, per-tool renderers (place, replace, cancel) produce friendly summaries that include the current target order and the Schwab preview line when present (falling back to the shared `format_arguments` fenced dump), and oversized bodies are auto-denied. Argument values arrive repr-encoded from `_format_argument` (auto-wrapped tools) or as plain strings (`place_previewed_order`); the renderers decode both, derive the last-4 `account_hash` suffix themselves, and never display the full hash. `SignalApprovalSettings.account_names` maps last-4 suffixes to friendly account names.
 - `base.parse_account_names()` parses suffix/name mappings for both backends; their static methods delegate to it. Discord shows mapped names or explicit unmapped suffixes on pending and final embeds when names are configured. The raw hash stays in Arguments. Invalid hashes and oversized names receive no Account field.
+- `base.format_outcome()` flattens an outcome line for display: control characters become spaces, invisible formatting characters are dropped, backticks are swapped for a look-alike, and the line is truncated.
 - Shared rendering lives in `base.format_arguments()`: arguments in a fenced code block with backtick sanitization. Upstream `_format_argument` truncates each value at 256 chars before any backend sees it. Discord uses that fenced rendering, neutralizes mentions, displays the complete field when it fits Discord's 1024-character field limit, and denies oversized requests while sending a short best-effort auto-denial notice without request arguments; Signal auto-denies oversized bodies.
 
 ## Flow
@@ -31,6 +32,7 @@ Provides the approval abstraction and the Discord- and Signal-backed implementat
 6. A valid ✅ sets `APPROVED`; a valid ❌ sets `DENIED`. The future is resolved first, with no await between the `done()` check and `set_result()`, so a second reaction or a timeout that arrives during the network edit cannot replace the recorded decision. Then the Discord message is edited to a final status embed including actor and notes. A failed edit is logged and does not change the decision.
 7. If no valid decision arrives before the timeout, `require()` records `EXPIRED`, edits the message with timeout notes, removes pending state, and returns the decision.
 8. If reaction setup fails, the manager finalizes the message as denied and returns `DENIED` so the write does not proceed silently.
+9. After an approved write runs, the tool calls `report_outcome()` once (through `tools._registration.report_outcome()`, best effort with a 10 s bound). Discord keeps the last 32 approved prompts and posts the outcome as a reply to the prompt with mentions disabled, or as a channel post when the prompt is no longer kept. Signal sends one notice naming the approval id. Denied and expired requests get no outcome.
 
 ## Integration
 

@@ -6,6 +6,7 @@ import ast
 import asyncio
 import logging
 import unicodedata
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -17,6 +18,7 @@ from schwab_mcp.approvals.base import (
     ApprovalManager,
     ApprovalRequest,
     format_arguments,
+    format_outcome,
     parse_account_names,
 )
 
@@ -24,6 +26,14 @@ logger = logging.getLogger(__name__)
 
 # How long start() waits for the bot to log in and become ready.
 _START_TIMEOUT_SECONDS = 30.0
+
+# Approved prompts kept so the write's outcome can be posted as a reply to
+# them. Bounded: an outcome that never arrives must not pin messages forever.
+_TRACKED_OUTCOME_MESSAGES = 32
+
+# Discord's message content limit is 2000 characters; the outcome line gets
+# what is left after the header and the code fence.
+_OUTCOME_LIMIT = 1800
 
 _INLINE_CODE_LIMIT = 100
 
@@ -96,6 +106,7 @@ class DiscordApprovalManager(ApprovalManager):
         self._ready = asyncio.Event()
         self._channel: discord.TextChannel | discord.Thread | None = None
         self._pending: dict[int, _PendingApproval] = {}
+        self._approved_messages: OrderedDict[str, discord.Message] = OrderedDict()
         self._lock = asyncio.Lock()
 
     async def start(self) -> None:
@@ -210,7 +221,39 @@ class DiscordApprovalManager(ApprovalManager):
             async with self._lock:
                 self._pending.pop(message.id, None)
 
+        if decision is ApprovalDecision.APPROVED:
+            self._remember_approved(request.id, message)
         return decision
+
+    async def report_outcome(
+        self,
+        request: ApprovalRequest,
+        outcome: str,
+        *,
+        succeeded: bool,
+    ) -> None:
+        """Post the write's outcome as a reply to its approval prompt.
+
+        Falls back to a plain channel post when the prompt is no longer kept.
+        Mentions are disabled: the outcome carries Schwab and exception text.
+        """
+        marker = "✅" if succeeded else "⚠️"
+        content = (
+            f"{marker} Outcome of `{request.tool_name}` (approval {request.id}):\n"
+            f"```\n{format_outcome(outcome, _OUTCOME_LIMIT)}\n```"
+        )
+        no_mentions = discord.AllowedMentions.none()
+        message = self._approved_messages.pop(request.id, None)
+        if message is not None:
+            await message.reply(content=content, mention_author=False, allowed_mentions=no_mentions)
+            return
+        channel = await self._ensure_channel()
+        await channel.send(content=content, allowed_mentions=no_mentions)
+
+    def _remember_approved(self, approval_id: str, message: discord.Message) -> None:
+        self._approved_messages[approval_id] = message
+        while len(self._approved_messages) > _TRACKED_OUTCOME_MESSAGES:
+            self._approved_messages.popitem(last=False)
 
     async def _run_client(self) -> None:
         try:

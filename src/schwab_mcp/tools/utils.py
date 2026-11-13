@@ -33,6 +33,9 @@ class SchwabAPIError(Exception):
         url: str,
         body: str,
     ) -> None:
+        self.status_code = status_code
+        self.url = url
+        self.body = body
         super().__init__(f"Schwab API request failed; status={status_code}; url={url}; body={body}")
 
 
