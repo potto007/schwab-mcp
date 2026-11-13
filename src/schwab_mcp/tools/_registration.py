@@ -206,19 +206,31 @@ _CANCELLED_OUTCOME = "outcome unknown (the call was cancelled); check Schwab"
 _BACKGROUND_REPORTS: set[asyncio.Task[None]] = set()
 
 
-def report_outcome_soon(context: SchwabContext, request: ApprovalRequest, outcome: str, *, succeeded: bool) -> None:
+def report_outcome_soon(
+    context: SchwabContext, request: ApprovalRequest, outcome: str, *, succeeded: bool
+) -> asyncio.Task[None]:
     """Report from a task of its own, for a caller that is being cancelled.
 
     A cancelled caller cannot await the report itself: the cancellation would
     be delivered again at its next await.
     """
-    task = asyncio.get_running_loop().create_task(report_outcome(context, request, outcome, succeeded=succeeded))
+    task = asyncio.get_running_loop().create_task(_send_outcome(context, request, outcome, succeeded=succeeded))
     _BACKGROUND_REPORTS.add(task)
     task.add_done_callback(_BACKGROUND_REPORTS.discard)
+    return task
 
 
 async def report_outcome(context: SchwabContext, request: ApprovalRequest, outcome: str, *, succeeded: bool) -> None:
     """Tell the reviewer what an approved write did, best effort.
+
+    The report runs in its own task, so cancelling the caller while it is in
+    flight does not lose it.
+    """
+    await asyncio.shield(report_outcome_soon(context, request, outcome, succeeded=succeeded))
+
+
+async def _send_outcome(context: SchwabContext, request: ApprovalRequest, outcome: str, *, succeeded: bool) -> None:
+    """Send one outcome report, bounded in time.
 
     The write has already happened, so a broken or stalled approval channel
     is logged and never changes the tool's result or masks its error.
