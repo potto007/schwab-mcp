@@ -15,7 +15,7 @@ import datetime
 import json
 import math
 import os
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -107,70 +107,167 @@ def _is_option(leg: dict[str, Any]) -> bool:
     return str(_instrument(leg).get("assetType", "")).upper() == "OPTION"
 
 
-def _node_value(node: dict[str, Any], legs: list[dict[str, Any]]) -> float | None:
-    """Highest price times largest leg quantity (x100 for options), or None.
+def _quote_key(symbol: str) -> str:
+    """Match quotes and legs whether or not option symbols carry their padding."""
+    return symbol.upper().replace(" ", "")
 
-    A missing, zero or negative price or quantity is not a bound, so the node
-    counts as unpriced.
+
+def leg_symbols(order_spec: dict[str, Any]) -> list[str]:
+    """Every distinct leg symbol in an order spec, in order of appearance."""
+    symbols: list[str] = []
+    for node in _nodes(order_spec):
+        for leg in _legs(node):
+            symbol = _instrument(leg).get("symbol")
+            if isinstance(symbol, str) and symbol and symbol not in symbols:
+                symbols.append(symbol)
+    return symbols
+
+
+def _option_terms(symbol: str) -> tuple[str, str, str, float] | None:
+    """(root, expiry, C/P, strike) from a 21-character option symbol, or None."""
+    text = symbol.upper()
+    if len(text) != 21:
+        return None
+    root, expiry, kind, strike = text[:6].strip(), text[6:12], text[12], text[13:]
+    if not root or not expiry.isdigit() or kind not in ("C", "P") or not strike.isdigit():
+        return None
+    return root, expiry, kind, int(strike) / 1000
+
+
+def _undeterminable() -> PermissionError:
+    return PermissionError("Refusing order: its value cannot be determined, so the max order value cannot be enforced.")
+
+
+@dataclass(slots=True, eq=False)
+class _LegValue:
+    leg: dict[str, Any]
+    symbol: str
+    quantity: float
+    unit: float
+    """Per-share (equity) or per-share premium (option) price used for this leg."""
+
+
+def _leg_values(node: dict[str, Any], legs: list[dict[str, Any]], references: dict[str, float]) -> list[_LegValue]:
+    order_prices = [
+        price
+        for price in (_number(node.get("price")), _number(node.get("stopPrice")))
+        if price is not None and price > 0
+    ]
+    values: list[_LegValue] = []
+    for leg in legs:
+        quantity = _number(leg.get("quantity"))
+        if quantity is None or quantity <= 0:
+            raise _undeterminable()
+        symbol = str(_instrument(leg).get("symbol", ""))
+        reference = references.get(_quote_key(symbol))
+        if reference is None:
+            raise PermissionError(f"Refusing order: no market quote for {symbol!r}, so its value cannot be bounded.")
+        # A single-leg order's own price is per share; a combo's is a net price.
+        unit = max(reference, *order_prices) if len(legs) == 1 and order_prices else reference
+        values.append(_LegValue(leg, symbol, quantity, unit))
+    return values
+
+
+def _instruction(leg: dict[str, Any]) -> str:
+    return str(leg.get("instruction", "")).upper()
+
+
+def _pair_spreads(values: list[_LegValue]) -> tuple[float, list[_LegValue]]:
+    """Value matched verticals at their width; return that total and the unmatched legs.
+
+    A short option (SELL_TO_OPEN) is matched with a long option (BUY_TO_OPEN)
+    on the same root, expiry and type with the same quantity. The pair is
+    valued at (strike width + long premium) x 100 x quantity, which covers
+    the spread's worst case.
     """
-    prices = [price for price in (_number(node.get("price")), _number(node.get("stopPrice"))) if price is not None]
-    quantities = [_number(leg.get("quantity")) for leg in legs]
-    if not prices or any(price <= 0 for price in prices):
-        return None
-    if any(quantity is None or quantity <= 0 for quantity in quantities):
-        return None
-    multiplier = _OPTION_MULTIPLIER if any(_is_option(leg) for leg in legs) else 1
-    return max(prices) * max(q for q in quantities if q is not None) * multiplier
+    total = 0.0
+    longs = [value for value in values if _is_option(value.leg) and _instruction(value.leg) == "BUY_TO_OPEN"]
+    unmatched = list(values)
+    for short in [value for value in values if _is_option(value.leg) and _instruction(value.leg) == "SELL_TO_OPEN"]:
+        short_terms = _option_terms(short.symbol)
+        if short_terms is None:
+            continue
+        for long in longs:
+            long_terms = _option_terms(long.symbol)
+            if (
+                long in unmatched
+                and long_terms is not None
+                and long_terms[:3] == short_terms[:3]
+                and long.quantity == short.quantity
+            ):
+                total += (abs(short_terms[3] - long_terms[3]) + long.unit) * _OPTION_MULTIPLIER * short.quantity
+                unmatched.remove(short)
+                unmatched.remove(long)
+                break
+    return total, unmatched
 
 
-def _strategy_bound(node: dict[str, Any]) -> tuple[float, bool]:
-    """Dollar bound of a strategy node and whether every executable node was priced.
+def _leg_exposure(value: _LegValue) -> float:
+    if not _is_option(value.leg):
+        return value.unit * value.quantity
+    if _instruction(value.leg) == "SELL_TO_OPEN":
+        terms = _option_terms(value.symbol)
+        if terms is None:
+            raise _undeterminable()
+        # Assignment: the strike plus the premium covers a put's obligation
+        # and an in-the-money call's underlying value.
+        return (terms[3] + value.unit) * _OPTION_MULTIPLIER * value.quantity
+    return value.unit * _OPTION_MULTIPLIER * value.quantity
+
+
+def _node_value(node: dict[str, Any], legs: list[dict[str, Any]], references: dict[str, float]) -> float:
+    """Exposure of one node with legs, every leg valued against its market quote.
+
+    Equity legs count shares x max(order price, quote); long options count
+    premium x 100; short options count (strike + premium) x 100 unless matched
+    in a vertical, which counts its width. A combo's own net price is one
+    more bound.
+    """
+    values = _leg_values(node, legs, references)
+    total, unmatched = _pair_spreads(values)
+    total += sum(_leg_exposure(value) for value in unmatched)
+    net = _number(node.get("price"))
+    if len(legs) > 1 and net is not None and net > 0:
+        multiplier = _OPTION_MULTIPLIER if any(_is_option(leg) for leg in legs) else 1
+        total = max(total, net * max(value.quantity for value in values) * multiplier)
+    return total
+
+
+def _strategy_bound(node: dict[str, Any], references: dict[str, float]) -> float:
+    """Dollar bound of a strategy node.
 
     An OCO executes at most one child, so it takes the largest child. Any other
     strategy with children (TRIGGER) can execute the node and then each child,
     so their values add.
     """
-    bound = 0.0
-    complete = True
     legs = _legs(node)
-    if legs:
-        value = _node_value(node, legs)
-        if value is None:
-            complete = False
-        else:
-            bound = value
+    bound = _node_value(node, legs, references) if legs else 0.0
     children_raw = node.get("childOrderStrategies")
     children = [child for child in children_raw if isinstance(child, dict)] if isinstance(children_raw, list) else []
     if children:
-        child_bounds = [_strategy_bound(child) for child in children]
-        values = [value for value, _ in child_bounds]
+        values = [_strategy_bound(child, references) for child in children]
         is_oco = str(node.get("orderStrategyType", "")).upper() == "OCO"
         bound += max(values) if is_oco else sum(values)
-        complete = complete and all(child_complete for _, child_complete in child_bounds)
-    return bound, complete
+    return bound
 
 
-def order_value(order_spec: dict[str, Any], preview_value: float | None) -> float:
-    """Estimate an order's value in dollars, conservatively.
+def order_value(order_spec: dict[str, Any], preview_value: float | None, quotes: Mapping[str, float]) -> float:
+    """Estimate the most an order can move, in dollars, conservatively.
 
-    Each node with legs is valued at its highest price times its largest leg
-    quantity (times 100 for options). Composites follow their strategy: an OCO
-    takes its largest child, a TRIGGER adds its stages. Schwab's preview order
-    value counts too, and the larger figure wins. When any node has no usable
-    price (market, trailing stop, net-zero, a zero price), only a positive,
-    finite preview value can bound the order. Raises ``PermissionError`` when
-    the value cannot be determined, since the cap cannot be enforced.
+    Every leg is valued against its market quote (``quotes``, keyed by symbol)
+    as well as the order's own price, so a far-from-market sell or stop is
+    valued at the market; see ``_node_value`` for options and spreads.
+    Composites follow their strategy: an OCO takes its largest child, a
+    TRIGGER adds its stages. Schwab's preview order value can only raise the
+    figure. Raises ``PermissionError`` when a leg has no quote or the value
+    cannot be determined, since the cap cannot be enforced.
     """
-    bound, complete = _strategy_bound(order_spec)
+    references = {_quote_key(symbol): price for symbol, price in quotes.items() if price > 0 and math.isfinite(price)}
+    bound = _strategy_bound(order_spec, references)
     preview = abs(preview_value) if preview_value is not None and math.isfinite(preview_value) else 0.0
-    if not complete and preview <= 0:
-        bound = 0.0
     value = max(bound, preview)
     if value <= 0:
-        raise PermissionError(
-            "Refusing order: its value cannot be determined from its prices or Schwab's preview, "
-            "so the max order value cannot be enforced."
-        )
+        raise _undeterminable()
     return value
 
 
@@ -180,9 +277,11 @@ def _allowlist_symbol(leg: dict[str, Any]) -> str:
     return symbol[:6].strip() if _is_option(leg) else symbol.strip()
 
 
-def check_order(limits: TradingLimits, order_spec: dict[str, Any], preview_value: float | None) -> None:
+def check_order(
+    limits: TradingLimits, order_spec: dict[str, Any], preview_value: float | None, quotes: Mapping[str, float]
+) -> None:
     """Raise ``PermissionError`` if the order breaks a configured limit."""
-    value = order_value(order_spec, preview_value)
+    value = order_value(order_spec, preview_value, quotes)
     if value > limits.max_order_value:
         raise PermissionError(
             f"Refusing order: estimated value ${value:,.2f} exceeds the ${limits.max_order_value:,.2f} max order value."
@@ -307,4 +406,12 @@ class OrderLedger:
             os.close(fd)
 
 
-__all__ = ["OrderLedger", "OrderSlot", "TradingLimits", "check_order", "order_value", "parse_symbol_allowlist"]
+__all__ = [
+    "OrderLedger",
+    "OrderSlot",
+    "TradingLimits",
+    "check_order",
+    "leg_symbols",
+    "order_value",
+    "parse_symbol_allowlist",
+]

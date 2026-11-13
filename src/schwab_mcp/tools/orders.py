@@ -32,7 +32,7 @@ from typing_extensions import TypedDict
 
 from schwab_mcp.approvals import ApprovalDecision, ApprovalRequest
 from schwab_mcp.context import SchwabContext
-from schwab_mcp.limits import OrderLedger, OrderSlot, TradingLimits, check_order
+from schwab_mcp.limits import OrderLedger, OrderSlot, TradingLimits, check_order, leg_symbols
 from schwab_mcp.previews import PreviewOperation
 from schwab_mcp.tools._dates import parse_date
 from schwab_mcp.tools._protocols import ToolsClient
@@ -962,6 +962,11 @@ async def _commit_slot(ctx: SchwabContext, request: ApprovalRequest, account_has
     except PermissionError as exc:
         await _report_order_outcome(ctx, request, account_hash, f"not sent: {exc}", succeeded=False)
         raise
+    except Exception as exc:
+        await _report_order_outcome(
+            ctx, request, account_hash, f"not sent: {type(exc).__name__}: {exc}", succeeded=False
+        )
+        raise
 
 
 async def _post_write_order_result(
@@ -1402,6 +1407,46 @@ def _trading_guard(ctx: SchwabContext) -> tuple[TradingLimits, OrderLedger]:
     if limits is None or ledger is None:
         raise PermissionError("Trading limits are not configured; order writes are disabled.")
     return limits, ledger
+
+
+_QUOTE_PRICE_FIELDS = ("lastPrice", "mark", "askPrice", "bidPrice")
+
+
+def _quote_reference(entry: Any) -> float | None:
+    """Highest positive last, mark, ask or bid price in one Schwab quote entry."""
+    quote = entry.get("quote") if isinstance(entry, dict) else None
+    if not isinstance(quote, dict):
+        return None
+    prices = [
+        float(price)
+        for price in (quote.get(field) for field in _QUOTE_PRICE_FIELDS)
+        if not isinstance(price, bool) and isinstance(price, (int, float)) and math.isfinite(price) and price > 0
+    ]
+    return max(prices) if prices else None
+
+
+async def _market_quotes(ctx: SchwabContext, order_spec: dict[str, Any]) -> dict[str, float]:
+    """Reference prices for every leg symbol, so the value cap uses the market.
+
+    A quote that cannot be fetched refuses the order: without it a sell or a
+    stop far from the market could understate the order's value.
+    """
+    symbols = leg_symbols(order_spec)
+    if not symbols:
+        return {}
+    try:
+        payload = await call(ctx.quotes.get_quotes, symbols)
+    except (SchwabAPIError, ValueError, httpx.TransportError) as exc:
+        raise PermissionError(
+            f"Refusing order: market quotes are unavailable ({type(exc).__name__}), so its value cannot be bounded."
+        ) from exc
+    quotes: dict[str, float] = {}
+    if isinstance(payload, dict):
+        for symbol, entry in payload.items():
+            price = _quote_reference(entry)
+            if price is not None:
+                quotes[str(symbol)] = price
+    return quotes
 
 
 def _preview_order_value(preview: Any) -> float | None:
@@ -2064,12 +2109,13 @@ async def place_previewed_order(
     fails or returns no data. *Write operation.*
     """
     limits, ledger = _trading_guard(ctx)
-    ensure_approval_capacity(ctx, "place_previewed_order")
     peeked = ctx.previews.peek(preview_id, account_hash, operation=PreviewOperation.PLACE_ORDER)
-    check_order(limits, peeked.order_spec, peeked.order_value)
-    # No await from here to run_approval's own cap check: the limit checks,
-    # the daily slot, consuming the preview and requesting approval happen
-    # together, and a refusal above leaves the preview usable.
+    quotes = await _market_quotes(ctx, peeked.order_spec)
+    check_order(limits, peeked.order_spec, peeked.order_value, quotes)
+    # No await from here to run_approval's own cap check: checking the cap,
+    # taking a daily slot, consuming the preview and requesting approval
+    # happen together, and a refusal leaves the preview usable.
+    ensure_approval_capacity(ctx, "place_previewed_order")
     slot = ledger.reserve(limits.max_daily_orders)
     try:
         entry = ctx.previews.pop(preview_id, account_hash, operation=PreviewOperation.PLACE_ORDER)
@@ -2137,7 +2183,8 @@ async def replace_previewed_order(
     target_order_id = peeked.target_order_id.strip() if peeked.target_order_id is not None else None
     if not target_order_id:
         raise ValueError("Replacement preview is missing its target order id.")
-    check_order(limits, peeked.order_spec, peeked.order_value)
+    quotes = await _market_quotes(ctx, peeked.order_spec)
+    check_order(limits, peeked.order_spec, peeked.order_value, quotes)
     current_order = await _fetch_current_order(ctx, account_hash, target_order_id, "replace")
     # No await from here to run_approval's own cap check: checking the cap,
     # taking a daily slot, consuming the preview and requesting approval

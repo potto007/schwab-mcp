@@ -359,3 +359,12 @@ def working_order(
             }
         ],
     }
+
+
+def quotes_payload(symbols: list[str], price: float = 1.0) -> dict[str, Any]:
+    """A Schwab get_quotes payload with one last price for every symbol.
+
+    The default is low so an order's own limit price sets its value in tests
+    that are not about the value cap.
+    """
+    return {symbol: {"quote": {"lastPrice": price}} for symbol in symbols}

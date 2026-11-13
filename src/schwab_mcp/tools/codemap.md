@@ -89,7 +89,8 @@ compact defaults with `verbose=True` escape hatches where response size matters.
     `_preview_line()` (est. value, commission and fees, buying power,
     warnings), which the place and replace prompts show as `schwab_preview`,
     plus `_preview_order_value()` for the limits check. Before approval both
-    executors require configured limits (`_trading_guard()`), run
+    executors require configured limits (`_trading_guard()`), fetch market
+    quotes for every leg (`_market_quotes()`; unavailable quotes refuse), run
     `limits.check_order()` on the peeked preview, and reserve a daily slot,
     all before the preview is consumed, so a refusal leaves it usable; the
     slot is committed (`_commit_slot()`) right before the write and released

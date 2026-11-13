@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Any, cast
 
 import pytest
-from conftest import make_ctx, run
+from conftest import make_ctx, quotes_payload, run
 
 from schwab_mcp.approvals.discord import DiscordApprovalManager
 from schwab_mcp.approvals.signal import _BODY_LIMIT, SignalApprovalManager, SignalApprovalSettings
@@ -30,6 +30,9 @@ class SummaryClient:
     async def get_instruments(self, *args: Any, **kwargs: Any) -> Any:
         self.calls.append("get_instruments")
         return {}
+
+    async def get_quotes(self, symbols: list[str], **kwargs: Any) -> Any:
+        return quotes_payload(symbols)
 
     async def preview_order(self, *args: Any, **kwargs: Any) -> Any:
         self.calls.append("preview_order")
@@ -262,6 +265,10 @@ def test_summary_refuses_values_it_cannot_show(mutate: Callable[[dict[str, Any]]
         orders._spec_summary(spec)
 
 
+async def passthrough(func: Any, *args: Any, **kwargs: Any) -> Any:
+    return await func(*args, **kwargs)
+
+
 def test_approval_request_carries_summary_of_placed_spec(monkeypatch: pytest.MonkeyPatch) -> None:
     """The approval request shows the summary of exactly the spec that is placed."""
     ctx = make_ctx(SummaryClient())
@@ -281,6 +288,7 @@ def test_approval_request_carries_summary_of_placed_spec(monkeypatch: pytest.Mon
         return orders.ApprovalDecision.DENIED
 
     monkeypatch.setattr(orders, "run_approval", approve)
+    monkeypatch.setattr(orders, "call", passthrough)
 
     with pytest.raises(PermissionError):
         run(orders.place_previewed_order(ctx, ACCOUNT, preview_id))

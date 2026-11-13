@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import httpx
 import pytest
-from conftest import make_ctx, run, working_order
+from conftest import make_ctx, quotes_payload, run, working_order
 from schwab.client import AsyncClient as SchwabAsyncClient
 
 from schwab_mcp.approvals import ApprovalDecision, ApprovalManager, ApprovalRequest
@@ -23,6 +23,9 @@ class ReplacementClient:
         self.replacement_payload: dict[str, Any] | None = None
         self.replacement_calls = 0
         self.place_calls = 0
+
+    async def get_quotes(self, symbols: list[str], **kwargs: Any) -> Any:
+        return quotes_payload(symbols)
 
     async def preview_order(self, **kwargs: Any) -> dict[str, Any]:
         self.preview_payload = kwargs
