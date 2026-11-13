@@ -32,7 +32,7 @@ from typing_extensions import TypedDict
 
 from schwab_mcp.approvals import ApprovalDecision, ApprovalRequest
 from schwab_mcp.context import SchwabContext
-from schwab_mcp.limits import OrderLedger, OrderSlot, TradingLimits, check_order, leg_symbols
+from schwab_mcp.limits import OrderLedger, OrderSlot, TradingLimits, check_order, quote_symbols
 from schwab_mcp.previews import PreviewEntry, PreviewOperation
 from schwab_mcp.tools._dates import parse_date
 from schwab_mcp.tools._protocols import ToolsClient
@@ -1444,12 +1444,12 @@ def _quote_reference(entry: Any) -> float | None:
 
 
 async def _market_quotes(ctx: SchwabContext, order_spec: dict[str, Any]) -> dict[str, float]:
-    """Reference prices for every leg symbol, so the value cap uses the market.
+    """Reference prices for every leg (and short call underlying), so the value cap uses the market.
 
     A quote that cannot be fetched refuses the order: without it a sell or a
     stop far from the market could understate the order's value.
     """
-    symbols = leg_symbols(order_spec)
+    symbols = quote_symbols(order_spec)
     if not symbols:
         return {}
     try:

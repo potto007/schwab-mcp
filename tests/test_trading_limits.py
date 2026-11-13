@@ -29,7 +29,15 @@ from schwab.client import AsyncClient
 from schwab_mcp import tools as tools_module
 from schwab_mcp.approvals import ApprovalDecision, ApprovalManager, ApprovalRequest
 from schwab_mcp.context import SchwabContext, SchwabServerContext
-from schwab_mcp.limits import OrderLedger, TradingLimits, check_order, order_value, parse_symbol_allowlist
+from schwab_mcp.limits import (
+    OrderLedger,
+    TradingLimits,
+    check_order,
+    leg_symbols,
+    order_value,
+    parse_symbol_allowlist,
+    quote_symbols,
+)
 from schwab_mcp.previews import PreviewOperation
 from schwab_mcp.tools import _registration, orders
 
@@ -89,6 +97,7 @@ SPY_530C = "SPY   251219C00530000"
 QUOTES: dict[str, float] = {
     "AAPL": 1.0,
     "NVDA": 100.0,
+    "SPY": 450.0,
     "SPY251219C00500000": 5.0,
     SPY_510C: 2.0,
     SPY_550C: 1.0,
@@ -158,6 +167,42 @@ def test_short_option_is_valued_at_strike_plus_premium() -> None:
     short_call = combo("LIMIT", "0.01", leg("SELL_TO_OPEN", 50, SPY_500C))
 
     assert value(short_call) == (500.0 + 5.0) * 100 * 50
+
+
+def test_short_call_in_the_money_is_valued_at_the_underlying() -> None:
+    # A stale one-cent option quote cannot hide a deep in-the-money call.
+    quotes = {**QUOTES, "SPY": 600.0, "SPY251219C00500000": 0.01}
+    short_call = combo("LIMIT", "0.01", leg("SELL_TO_OPEN", 10, SPY_500C))
+
+    assert value(short_call, quotes=quotes) == (600.0 + 0.01) * 100 * 10
+
+
+def test_short_call_without_an_underlying_quote_is_refused() -> None:
+    quotes = {key: price for key, price in QUOTES.items() if key != "SPY"}
+
+    with pytest.raises(PermissionError, match="no market quote for 'SPY'"):
+        value(combo("LIMIT", "1.00", leg("SELL_TO_OPEN", 1, SPY_500C)), quotes=quotes)
+
+
+def test_short_puts_and_verticals_do_not_need_the_underlying() -> None:
+    quotes = {key: price for key, price in QUOTES.items() if key != "SPY"}
+    credit = combo("NET_CREDIT", "0.05", leg("SELL_TO_OPEN", 1, SPY_500C), leg("BUY_TO_OPEN", 1, SPY_550C))
+
+    assert value(combo("LIMIT", "1.00", leg("SELL_TO_OPEN", 1, SPY_480P)), quotes=quotes) == (480.0 + 3.0) * 100
+    assert value(credit, quotes=quotes) == (50.0 + 1.0) * 100
+
+
+def test_quote_symbols_add_the_underlying_of_short_calls() -> None:
+    spec = combo(
+        "NET_CREDIT",
+        "1.00",
+        leg("SELL_TO_OPEN", 1, SPY_520C),
+        leg("SELL_TO_OPEN", 1, SPY_480P),
+        leg("BUY_TO_OPEN", 1, SPY_530C),
+    )
+
+    assert quote_symbols(spec) == [SPY_520C, SPY_480P, SPY_530C, "SPY"]
+    assert quote_symbols(option_spec(quantity=1)) == leg_symbols(option_spec(quantity=1))
 
 
 def test_credit_vertical_is_valued_at_its_width() -> None:

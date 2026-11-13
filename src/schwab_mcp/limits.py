@@ -134,6 +134,22 @@ def _option_terms(symbol: str) -> tuple[str, str, str, float] | None:
     return root, expiry, kind, int(strike) / 1000
 
 
+def _is_short_call(leg: dict[str, Any], terms: tuple[str, str, str, float] | None) -> bool:
+    return _is_option(leg) and _instruction(leg) == "SELL_TO_OPEN" and terms is not None and terms[2] == "C"
+
+
+def quote_symbols(order_spec: dict[str, Any]) -> list[str]:
+    """Symbols to quote before valuing an order: every leg, plus each short call's underlying."""
+    symbols = leg_symbols(order_spec)
+    for node in _nodes(order_spec):
+        for leg in _legs(node):
+            symbol = _instrument(leg).get("symbol")
+            terms = _option_terms(symbol) if isinstance(symbol, str) else None
+            if terms is not None and _is_short_call(leg, terms) and terms[0] not in symbols:
+                symbols.append(terms[0])
+    return symbols
+
+
 def _undeterminable() -> PermissionError:
     return PermissionError("Refusing order: its value cannot be determined, so the max order value cannot be enforced.")
 
@@ -202,16 +218,26 @@ def _pair_spreads(values: list[_LegValue]) -> tuple[float, list[_LegValue]]:
     return total, unmatched
 
 
-def _leg_exposure(value: _LegValue) -> float:
+def _leg_exposure(value: _LegValue, references: dict[str, float]) -> float:
     if not _is_option(value.leg):
         return value.unit * value.quantity
     if _instruction(value.leg) == "SELL_TO_OPEN":
         terms = _option_terms(value.symbol)
         if terms is None:
             raise _undeterminable()
-        # Assignment: the strike plus the premium covers a put's obligation
-        # and an in-the-money call's underlying value.
-        return (terms[3] + value.unit) * _OPTION_MULTIPLIER * value.quantity
+        notional = terms[3]
+        if _is_short_call(value.leg, terms):
+            # An in-the-money call is worth the underlying, whatever its own
+            # (possibly stale) quote says.
+            underlying = references.get(_quote_key(terms[0]))
+            if underlying is None:
+                raise PermissionError(
+                    f"Refusing order: no market quote for {terms[0]!r}, the underlying of a short call, "
+                    "so its value cannot be bounded."
+                )
+            notional = max(notional, underlying)
+        # Assignment: the strike (or a call's underlying) plus the premium.
+        return (notional + value.unit) * _OPTION_MULTIPLIER * value.quantity
     return value.unit * _OPTION_MULTIPLIER * value.quantity
 
 
@@ -219,13 +245,14 @@ def _node_value(node: dict[str, Any], legs: list[dict[str, Any]], references: di
     """Exposure of one node with legs, every leg valued against its market quote.
 
     Equity legs count shares x max(order price, quote); long options count
-    premium x 100; short options count (strike + premium) x 100 unless matched
-    in a vertical, which counts its width. A combo's own net price is one
+    premium x 100; short options count (strike + premium) x 100, a short
+    call at least (underlying + premium) x 100, unless matched in a vertical,
+    which counts its width. A combo's own net price is one
     more bound.
     """
     values = _leg_values(node, legs, references)
     total, unmatched = _pair_spreads(values)
-    total += sum(_leg_exposure(value) for value in unmatched)
+    total += sum(_leg_exposure(value, references) for value in unmatched)
     net = _number(node.get("price"))
     if len(legs) > 1 and net is not None and net > 0:
         multiplier = _OPTION_MULTIPLIER if any(_is_option(leg) for leg in legs) else 1
