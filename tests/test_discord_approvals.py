@@ -282,6 +282,79 @@ async def test_pending_message_sanitizes_markdown_in_arguments() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Client metadata rendered as inline code
+# ---------------------------------------------------------------------------
+
+METADATA_CASES = [
+    pytest.param("**bold**", "`**bold**`", id="bold-markers"),
+    pytest.param(
+        "[link](https://example.com)",
+        "`[link](https://example.com)`",
+        id="link-syntax",
+    ),
+    pytest.param("@everyone", "`@everyone`", id="mention-text"),
+    pytest.param("line one\nline two", "`line oneline two`", id="newline"),
+    pytest.param("a`b``c", "`abc`", id="backticks"),
+    pytest.param("abc\u202edef", "`abcdef`", id="bidi-override"),
+    pytest.param("x" * 500, "`" + "x" * 99 + "\u2026`", id="long-value"),
+    pytest.param("`\n\u202e`", "`(empty)`", id="empty-after-cleanup"),
+    pytest.param(12345, "`12345`", id="int-value"),
+]
+
+
+def _field_values(embed: discord.Embed) -> dict[str, str | None]:
+    return {field.name or "": field.value for field in embed.fields}
+
+
+async def _final_embed(mgr: DiscordApprovalManager, request: ApprovalRequest) -> discord.Embed:
+    message = make_fake_message(make_fake_channel())
+    await mgr._finalize_message(
+        message,
+        request,
+        ApprovalDecision.APPROVED,
+        actor=None,
+        reason=None,
+    )
+    return message.edit.await_args.kwargs["embed"]
+
+
+@pytest.mark.parametrize(("raw", "expected"), METADATA_CASES)
+def test_pending_embed_renders_request_and_client_id_as_inline_code(raw: object, expected: str) -> None:
+    request = make_request(request_id=cast(Any, raw), client_id=cast(Any, raw))
+
+    fields = _field_values(make_manager()._build_pending_embed(request))
+
+    assert fields["Request ID"] == expected
+    assert fields["Client ID (unverified)"] == expected
+
+
+@pytest.mark.parametrize(("raw", "expected"), METADATA_CASES)
+@pytest.mark.anyio
+async def test_final_embed_renders_request_and_client_id_as_inline_code(raw: object, expected: str) -> None:
+    request = make_request(request_id=cast(Any, raw), client_id=cast(Any, raw))
+
+    fields = _field_values(await _final_embed(make_manager(), request))
+
+    assert fields["Request ID"] == expected
+    assert fields["Client ID (unverified)"] == expected
+
+
+def test_pending_embed_omits_client_id_field_when_absent() -> None:
+    fields = _field_values(make_manager()._build_pending_embed(make_request(client_id=None)))
+
+    assert fields["Request ID"] == "`req-1`"
+    assert "Client ID (unverified)" not in fields
+
+
+@pytest.mark.anyio
+async def test_final_embed_omits_client_id_field_when_absent() -> None:
+    fields = _field_values(await _final_embed(make_manager(), make_request(client_id=None)))
+
+    assert fields["Request ID"] == "`req-1`"
+    assert "Client ID (unverified)" not in fields
+
+
+# ---------------------------------------------------------------------------
 # start() / stop() lifecycle
 # ---------------------------------------------------------------------------
 

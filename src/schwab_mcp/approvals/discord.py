@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import logging
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -23,6 +24,21 @@ logger = logging.getLogger(__name__)
 
 # How long start() waits for the bot to log in and become ready.
 _START_TIMEOUT_SECONDS = 30.0
+
+_INLINE_CODE_LIMIT = 100
+
+
+def _inline_code(value: object, limit: int = _INLINE_CODE_LIMIT) -> str:
+    """Render a client-supplied value as inline code for readability.
+
+    Backticks and control/format characters (Unicode categories Cc and Cf,
+    including newlines and bidi overrides) are removed, and values longer than
+    ``limit`` characters are shortened with a trailing ellipsis.
+    """
+    text = "".join(char for char in str(value) if char != "`" and unicodedata.category(char) not in {"Cc", "Cf"})
+    if len(text) > limit:
+        text = text[: limit - 1] + "\u2026"
+    return f"`{text or '(empty)'}`"
 
 
 @dataclass(slots=True, frozen=True)
@@ -281,11 +297,11 @@ class DiscordApprovalManager(ApprovalManager):
         account_label = self._account_label(request.arguments)
         if account_label:
             embed.add_field(name="Account", value=account_label, inline=False)
-        embed.add_field(name="Request ID", value=request.request_id, inline=False)
+        embed.add_field(name="Request ID", value=_inline_code(request.request_id), inline=False)
         embed.add_field(name="Approval ID", value=request.id, inline=False)
         if request.client_id:
             # Client-supplied request metadata, not an authenticated identity.
-            embed.add_field(name="Client ID (unverified)", value=request.client_id, inline=False)
+            embed.add_field(name="Client ID (unverified)", value=_inline_code(request.client_id), inline=False)
         if request.arguments:
             embed.add_field(
                 name="Arguments",
@@ -312,11 +328,11 @@ class DiscordApprovalManager(ApprovalManager):
         account_label = self._account_label(request.arguments)
         if account_label:
             embed.add_field(name="Account", value=account_label, inline=False)
-        embed.add_field(name="Request ID", value=request.request_id, inline=False)
+        embed.add_field(name="Request ID", value=_inline_code(request.request_id), inline=False)
         embed.add_field(name="Approval ID", value=request.id, inline=False)
         if request.client_id:
             # Client-supplied request metadata, not an authenticated identity.
-            embed.add_field(name="Client ID (unverified)", value=request.client_id, inline=False)
+            embed.add_field(name="Client ID (unverified)", value=_inline_code(request.client_id), inline=False)
         if request.arguments:
             embed.add_field(
                 name="Arguments",
