@@ -32,8 +32,8 @@ from typing_extensions import TypedDict
 
 from schwab_mcp.approvals import ApprovalDecision, ApprovalRequest
 from schwab_mcp.context import SchwabContext
-from schwab_mcp.limits import OrderLedger, OrderSlot, TradingLimits, check_order, leg_symbols
-from schwab_mcp.previews import PreviewOperation
+from schwab_mcp.limits import OrderLedger, OrderSlot, TradingLimits, check_order, quote_symbols
+from schwab_mcp.previews import PreviewEntry, PreviewOperation
 from schwab_mcp.tools._dates import parse_date
 from schwab_mcp.tools._protocols import ToolsClient
 from schwab_mcp.tools._registration import (
@@ -978,10 +978,28 @@ async def _run_order_write(
     return result
 
 
-async def _commit_slot(ctx: SchwabContext, request: ApprovalRequest, account_hash: str, slot: OrderSlot) -> None:
-    """Count an approved order under the daily cap, telling the reviewer if it cannot be sent."""
+async def _prepare_send(
+    ctx: SchwabContext,
+    request: ApprovalRequest,
+    account_hash: str,
+    limits: TradingLimits,
+    entry: PreviewEntry,
+    slot: OrderSlot,
+) -> None:
+    """Re-check an approved order against fresh quotes, then count it under the daily cap.
+
+    Prices can move while the reviewer decides, so the value cap is checked
+    again just before sending. If either step refuses, the reviewer is told
+    the order was not sent.
+    """
     try:
+        quotes = await _market_quotes(ctx, entry.order_spec)
+        check_order(limits, entry.order_spec, entry.order_value, quotes)
+        # Counted before sending: a write that fails still used a slot.
         slot.commit()
+    except asyncio.CancelledError:
+        report_outcome_soon(ctx, request, "not sent (the call was cancelled)", succeeded=False)
+        raise
     except PermissionError as exc:
         await _report_order_outcome(ctx, request, account_hash, f"not sent: {exc}", succeeded=False)
         raise
@@ -1449,12 +1467,12 @@ def _quote_reference(entry: Any) -> float | None:
 
 
 async def _market_quotes(ctx: SchwabContext, order_spec: dict[str, Any]) -> dict[str, float]:
-    """Reference prices for every leg symbol, so the value cap uses the market.
+    """Reference prices for every leg (and short call underlying), so the value cap uses the market.
 
     A quote that cannot be fetched refuses the order: without it a sell or a
     stop far from the market could understate the order's value.
     """
-    symbols = leg_symbols(order_spec)
+    symbols = quote_symbols(order_spec)
     if not symbols:
         return {}
     try:
@@ -2133,6 +2151,8 @@ async def place_previewed_order(
     """
     limits, ledger = _trading_guard(ctx)
     peeked = ctx.previews.peek(preview_id, account_hash, operation=PreviewOperation.PLACE_ORDER)
+    # Checked again below; refusing here first saves a quote request.
+    ensure_approval_capacity(ctx, "place_previewed_order")
     quotes = await _market_quotes(ctx, peeked.order_spec)
     check_order(limits, peeked.order_spec, peeked.order_value, quotes)
     # No await from here to run_approval's own cap check: checking the cap,
@@ -2159,8 +2179,7 @@ async def place_previewed_order(
 
         decision = await run_approval(ctx, request)
         if decision is ApprovalDecision.APPROVED:
-            # Counted before sending: a write that fails still used a slot.
-            await _commit_slot(ctx, request, account_hash, slot)
+            await _prepare_send(ctx, request, account_hash, limits, entry, slot)
 
             async def write() -> JSONType:
                 return await call(
@@ -2206,6 +2225,8 @@ async def replace_previewed_order(
     target_order_id = peeked.target_order_id.strip() if peeked.target_order_id is not None else None
     if not target_order_id:
         raise ValueError("Replacement preview is missing its target order id.")
+    # Checked again below; refusing here first saves Schwab requests.
+    ensure_approval_capacity(ctx, "replace_previewed_order")
     quotes = await _market_quotes(ctx, peeked.order_spec)
     check_order(limits, peeked.order_spec, peeked.order_value, quotes)
     current_order = await _fetch_current_order(ctx, account_hash, target_order_id, "replace")
@@ -2236,8 +2257,7 @@ async def replace_previewed_order(
 
         decision = await run_approval(ctx, request)
         if decision is ApprovalDecision.APPROVED:
-            # Counted before sending: a write that fails still used a slot.
-            await _commit_slot(ctx, request, account_hash, slot)
+            await _prepare_send(ctx, request, account_hash, limits, entry, slot)
 
             async def write() -> JSONType:
                 return await call(

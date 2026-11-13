@@ -9,7 +9,7 @@ from conftest import make_ctx, quotes_payload, run, working_order
 from mcp.server.mcpserver import MCPServer
 
 from schwab_mcp.approvals import ApprovalDecision
-from schwab_mcp.limits import leg_symbols
+from schwab_mcp.limits import quote_symbols
 from schwab_mcp.tools import orders
 from schwab_mcp.tools.utils import SchwabAPIError
 
@@ -507,7 +507,7 @@ class TestPlacePreviewedOrder:
         """These tests count call() invocations; serve quotes without one."""
 
         async def quotes(_ctx: Any, order_spec: dict[str, Any]) -> dict[str, float]:
-            return dict.fromkeys(leg_symbols(order_spec), 1.0)
+            return dict.fromkeys(quote_symbols(order_spec), 1.0)
 
         monkeypatch.setattr(orders, "_market_quotes", quotes)
 

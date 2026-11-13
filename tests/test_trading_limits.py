@@ -7,6 +7,7 @@ asked and leaves the preview usable. The daily count survives a restart.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import os
@@ -28,9 +29,17 @@ from schwab.client import AsyncClient
 from schwab_mcp import tools as tools_module
 from schwab_mcp.approvals import ApprovalDecision, ApprovalManager, ApprovalRequest
 from schwab_mcp.context import SchwabContext, SchwabServerContext
-from schwab_mcp.limits import OrderLedger, TradingLimits, check_order, order_value, parse_symbol_allowlist
+from schwab_mcp.limits import (
+    OrderLedger,
+    TradingLimits,
+    check_order,
+    leg_symbols,
+    order_value,
+    parse_symbol_allowlist,
+    quote_symbols,
+)
 from schwab_mcp.previews import PreviewOperation
-from schwab_mcp.tools import orders
+from schwab_mcp.tools import _registration, orders
 
 ACCOUNT = "A" * 60 + "1234"
 TARGET_ID = "1000123"
@@ -88,6 +97,7 @@ SPY_530C = "SPY   251219C00530000"
 QUOTES: dict[str, float] = {
     "AAPL": 1.0,
     "NVDA": 100.0,
+    "SPY": 450.0,
     "SPY251219C00500000": 5.0,
     SPY_510C: 2.0,
     SPY_550C: 1.0,
@@ -157,6 +167,42 @@ def test_short_option_is_valued_at_strike_plus_premium() -> None:
     short_call = combo("LIMIT", "0.01", leg("SELL_TO_OPEN", 50, SPY_500C))
 
     assert value(short_call) == (500.0 + 5.0) * 100 * 50
+
+
+def test_short_call_in_the_money_is_valued_at_the_underlying() -> None:
+    # A stale one-cent option quote cannot hide a deep in-the-money call.
+    quotes = {**QUOTES, "SPY": 600.0, "SPY251219C00500000": 0.01}
+    short_call = combo("LIMIT", "0.01", leg("SELL_TO_OPEN", 10, SPY_500C))
+
+    assert value(short_call, quotes=quotes) == (600.0 + 0.01) * 100 * 10
+
+
+def test_short_call_without_an_underlying_quote_is_refused() -> None:
+    quotes = {key: price for key, price in QUOTES.items() if key != "SPY"}
+
+    with pytest.raises(PermissionError, match="no market quote for 'SPY'"):
+        value(combo("LIMIT", "1.00", leg("SELL_TO_OPEN", 1, SPY_500C)), quotes=quotes)
+
+
+def test_short_puts_and_verticals_do_not_need_the_underlying() -> None:
+    quotes = {key: price for key, price in QUOTES.items() if key != "SPY"}
+    credit = combo("NET_CREDIT", "0.05", leg("SELL_TO_OPEN", 1, SPY_500C), leg("BUY_TO_OPEN", 1, SPY_550C))
+
+    assert value(combo("LIMIT", "1.00", leg("SELL_TO_OPEN", 1, SPY_480P)), quotes=quotes) == (480.0 + 3.0) * 100
+    assert value(credit, quotes=quotes) == (50.0 + 1.0) * 100
+
+
+def test_quote_symbols_add_the_underlying_of_short_calls() -> None:
+    spec = combo(
+        "NET_CREDIT",
+        "1.00",
+        leg("SELL_TO_OPEN", 1, SPY_520C),
+        leg("SELL_TO_OPEN", 1, SPY_480P),
+        leg("BUY_TO_OPEN", 1, SPY_530C),
+    )
+
+    assert quote_symbols(spec) == [SPY_520C, SPY_480P, SPY_530C, "SPY"]
+    assert quote_symbols(option_spec(quantity=1)) == leg_symbols(option_spec(quantity=1))
 
 
 def test_credit_vertical_is_valued_at_its_width() -> None:
@@ -428,15 +474,19 @@ class Client:
         self.preview = preview if preview is not None else {}
         self.quotes = {"AAPL": 1.0} if quotes is None else quotes
         self.quote_error = quote_error
+        self.quote_calls = 0
+        self.quotes_after_first: dict[str, float] | None = None
         self.calls: list[str] = []
 
     async def get_instruments(self, symbol: str, **kwargs: Any) -> Any:
         return {"instruments": [{"symbol": symbol, "assetType": "EQUITY"}]}
 
     async def get_quotes(self, symbols: list[str], **kwargs: Any) -> Any:
+        self.quote_calls += 1
         if self.quote_error:
             raise httpx.ConnectError("quotes down")
-        return {symbol: {"quote": {"lastPrice": self.quotes[symbol]}} for symbol in symbols if symbol in self.quotes}
+        quotes = self.quotes if self.quotes_after_first is None or self.quote_calls == 1 else self.quotes_after_first
+        return {symbol: {"quote": {"lastPrice": quotes[symbol]}} for symbol in symbols if symbol in quotes}
 
     async def preview_order(self, *args: Any, **kwargs: Any) -> Any:
         return self.preview
@@ -759,3 +809,108 @@ def test_registered_market_order_is_bounded_by_its_quote(preview_value: float | 
     )
     assert harness.approvals.requests == []
     assert harness.client.calls == []
+
+
+# --- send-time re-check and early capacity check ---------------------------------
+
+
+class OutcomeRecorder(Approvals):
+    def __init__(self) -> None:
+        super().__init__()
+        self.outcomes: list[tuple[str, bool]] = []
+
+    async def report_outcome(self, request: ApprovalRequest, outcome: str, *, succeeded: bool) -> None:
+        self.outcomes.append((outcome, succeeded))
+
+
+def test_a_price_move_during_approval_is_caught_before_sending() -> None:
+    client, approvals = Client(quotes={"AAPL": 1.0}), OutcomeRecorder()
+    ledger = OrderLedger(None)
+    ctx = _ctx(client, approvals, limits=TradingLimits(max_order_value=5_000.0, max_daily_orders=1), ledger=ledger)
+    preview_id = _preview(ctx, quantity=10, price=150.0)
+    client.quotes_after_first = {"AAPL": 600.0}
+
+    with pytest.raises(PermissionError, match=r"\$6,000.00 exceeds"):
+        run(orders.place_previewed_order(ctx, ACCOUNT, preview_id))
+
+    assert len(approvals.requests) == 1
+    assert client.calls == []
+    [(outcome, succeeded)] = approvals.outcomes
+    assert outcome.startswith("not sent: Refusing order: estimated value $6,000.00 exceeds")
+    assert succeeded is False
+    # The refused order did not use the day's only slot.
+    ledger.reserve(1)
+
+
+def test_quotes_unavailable_at_send_time_block_the_order() -> None:
+    client, approvals = Client(quotes={"AAPL": 1.0}), OutcomeRecorder()
+    ctx = _ctx(client, approvals)
+    preview_id = _preview(ctx)
+    client.quotes_after_first = {}
+
+    with pytest.raises(PermissionError, match="no market quote for 'AAPL'"):
+        run(orders.place_previewed_order(ctx, ACCOUNT, preview_id))
+
+    assert client.calls == []
+    assert approvals.outcomes[0][0].startswith("not sent: Refusing order: no market quote")
+
+
+def test_replace_rechecks_the_value_before_sending() -> None:
+    client, approvals = Client(quotes={"AAPL": 1.0}), OutcomeRecorder()
+    ctx = _ctx(client, approvals)
+    small = {"symbol": "AAPL", "quantity": 10, "instruction": "BUY", "order_type": "LIMIT", "price": 150.0}
+    preview = run(orders.preview_replacement_order(ctx, ACCOUNT, TARGET_ID, cast(orders._OrderDescInput, small)))
+    client.quotes_after_first = {"AAPL": 600.0}
+
+    with pytest.raises(PermissionError, match=r"\$6,000.00 exceeds"):
+        run(orders.replace_previewed_order(ctx, ACCOUNT, preview["preview_id"]))
+
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("tool", ["place_previewed_order", "replace_previewed_order"])
+def test_full_approval_queue_refuses_before_fetching_quotes(tool: str) -> None:
+    client, approvals = Client(), Approvals()
+    ctx = _ctx(client, approvals)
+    if tool == "place_previewed_order":
+        preview_id = _preview(ctx)
+    else:
+        small = {"symbol": "AAPL", "quantity": 1, "instruction": "BUY", "order_type": "LIMIT", "price": 1.0}
+        preview_id = run(
+            orders.preview_replacement_order(ctx, ACCOUNT, TARGET_ID, cast(orders._OrderDescInput, small))
+        )["preview_id"]
+    ctx.schwab.pending_approvals = _registration.MAX_PENDING_APPROVALS
+
+    with pytest.raises(PermissionError, match="already pending"):
+        run(getattr(orders, tool)(ctx, ACCOUNT, preview_id))
+
+    assert client.quote_calls == 0
+
+
+def test_a_cancelled_send_time_check_reports_not_sent(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, approvals = Client(), OutcomeRecorder()
+    ledger = OrderLedger(None)
+    ctx = _ctx(client, approvals, limits=TradingLimits(max_order_value=5_000.0, max_daily_orders=1), ledger=ledger)
+    preview_id = _preview(ctx)
+    real_quotes = orders._market_quotes
+    seen = 0
+
+    async def cancel_second(ctx: Any, order_spec: dict[str, Any]) -> dict[str, float]:
+        nonlocal seen
+        seen += 1
+        if seen == 2:
+            raise asyncio.CancelledError
+        return await real_quotes(ctx, order_spec)
+
+    monkeypatch.setattr(orders, "_market_quotes", cancel_second)
+
+    async def place() -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await orders.place_previewed_order(ctx, ACCOUNT, preview_id)
+        await asyncio.sleep(0)
+
+    run(place())
+
+    assert client.calls == []
+    assert approvals.outcomes == [("not sent (the call was cancelled)", False)]
+    ledger.reserve(1)

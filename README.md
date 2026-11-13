@@ -105,11 +105,13 @@ gateway or remote connector (MCP endpoint is `/mcp` on the bound host:port).
 > **Trading limits are required.** Write tools are enabled only when both
 > `--max-order-value` and `--max-daily-orders` are set (any write mode,
 > including `--jesus-take-the-wheel`); otherwise the server refuses to start.
-> Every order is checked before the reviewer is asked, against fresh market
-> quotes for each leg: its estimated value must not exceed the max. Shares
-> count at the higher of the order price and the market, so a sell or stop far
-> from the market is valued at the market; a long option counts its premium
-> times 100; a short option counts its strike plus premium times 100, unless
+> Every order is checked against fresh market quotes for each leg before the
+> reviewer is asked, and again just before it is sent: its estimated value
+> must not exceed the max. Shares count at the higher of the order price and
+> the market, so a sell or stop far from the market is valued at the market;
+> a long option counts its premium times 100; a short option counts its
+> strike plus premium times 100 (a short call at least its underlying's quote
+> plus premium, so it also needs a quote for the option's root symbol), unless
 > it is matched with a long option of the same underlying, expiry, type and
 > quantity, when the spread counts its strike width plus the long premium.
 > Composites count conservatively: a triggered order adds its stages, so a
