@@ -1225,17 +1225,34 @@ def _money(value: Any) -> str | None:
     return f"{sign}${abs(value):,.2f}"
 
 
+def _preview_entries(value: Any) -> list[Any]:
+    """Entries of one validation kind, whatever shape Schwab sent.
+
+    Only an absent or empty value means "none": a non-list value counts as one
+    entry, so an unexpected shape can never turn a rejection into an accept.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, (dict, str)) and not value:
+        return []
+    return [value]
+
+
 def _preview_messages(validation: Any, kinds: tuple[str, ...]) -> list[str]:
     messages: list[str] = []
     if not isinstance(validation, dict):
         return messages
     for kind in kinds:
-        entries = validation.get(kind)
-        for entry in entries if isinstance(entries, list) else []:
-            if not isinstance(entry, dict):
-                continue
-            raw = entry.get("message") or entry.get("activityMessage") or entry.get("validationRuleName") or kind
-            text = " ".join("".join(c if c.isprintable() else " " for c in str(raw)).split())
+        for entry in _preview_entries(validation.get(kind)):
+            raw: Any = None
+            if isinstance(entry, dict):
+                raw = entry.get("message") or entry.get("activityMessage") or entry.get("validationRuleName")
+            elif isinstance(entry, str):
+                raw = entry
+            text = " ".join("".join(c if c.isprintable() else " " for c in str(raw or "")).split())
+            text = text or f"{kind} (no message)"
             if len(text) > _PREVIEW_MESSAGE_LIMIT:
                 text = text[: _PREVIEW_MESSAGE_LIMIT - 1] + "\u2026"
             messages.append(text)
@@ -1246,7 +1263,10 @@ def _refuse_rejected_preview(preview: Any) -> None:
     """Raise if Schwab's preview rejected the order, so it is never cached."""
     if not isinstance(preview, dict):
         return
-    rejects = _preview_messages(preview.get("orderValidationResult"), ("rejects",))
+    validation = preview.get("orderValidationResult")
+    if validation and not isinstance(validation, dict):
+        raise ValueError("Refusing this preview: the validation result Schwab returned is unreadable.")
+    rejects = _preview_messages(validation, ("rejects",))
     if rejects:
         raise ValueError("Schwab's preview rejected this order: " + " | ".join(rejects))
 
