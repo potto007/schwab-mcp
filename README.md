@@ -107,8 +107,11 @@ gateway or remote connector (MCP endpoint is `/mcp` on the bound host:port).
 > including `--jesus-take-the-wheel`); otherwise the server refuses to start.
 > Every order is checked before the reviewer is asked: its estimated value
 > (highest price times largest leg quantity, times 100 for options, or
-> Schwab's preview order value when that is higher or the order has no price)
-> must not exceed the max, and an order whose value cannot be determined is
+> Schwab's preview order value when that is higher) must not exceed the max.
+> Composites count conservatively: a triggered order adds its stages, so a
+> bracket counts as its entry plus its largest exit, and a one-cancels-other
+> counts its largest branch. A market, trailing-stop or net-zero order needs a
+> positive preview value, and an order whose value cannot be determined is
 > refused. The daily cap counts placements and replacements sent to Schwab per
 > US/Eastern day in `daily-orders.json` (0600) in the data directory, so it
 > survives a restart and is shared by every server process using that

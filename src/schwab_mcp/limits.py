@@ -108,44 +108,70 @@ def _is_option(leg: dict[str, Any]) -> bool:
 
 
 def _node_value(node: dict[str, Any], legs: list[dict[str, Any]]) -> float | None:
+    """Highest price times largest leg quantity (x100 for options), or None.
+
+    A missing, zero or negative price or quantity is not a bound, so the node
+    counts as unpriced.
+    """
     prices = [price for price in (_number(node.get("price")), _number(node.get("stopPrice"))) if price is not None]
     quantities = [_number(leg.get("quantity")) for leg in legs]
-    if not prices or any(quantity is None for quantity in quantities):
+    if not prices or any(price <= 0 for price in prices):
+        return None
+    if any(quantity is None or quantity <= 0 for quantity in quantities):
         return None
     multiplier = _OPTION_MULTIPLIER if any(_is_option(leg) for leg in legs) else 1
-    return max(abs(price) for price in prices) * max(abs(q) for q in quantities if q is not None) * multiplier
+    return max(prices) * max(q for q in quantities if q is not None) * multiplier
+
+
+def _strategy_bound(node: dict[str, Any]) -> tuple[float, bool]:
+    """Dollar bound of a strategy node and whether every executable node was priced.
+
+    An OCO executes at most one child, so it takes the largest child. Any other
+    strategy with children (TRIGGER) can execute the node and then each child,
+    so their values add.
+    """
+    bound = 0.0
+    complete = True
+    legs = _legs(node)
+    if legs:
+        value = _node_value(node, legs)
+        if value is None:
+            complete = False
+        else:
+            bound = value
+    children_raw = node.get("childOrderStrategies")
+    children = [child for child in children_raw if isinstance(child, dict)] if isinstance(children_raw, list) else []
+    if children:
+        child_bounds = [_strategy_bound(child) for child in children]
+        values = [value for value, _ in child_bounds]
+        is_oco = str(node.get("orderStrategyType", "")).upper() == "OCO"
+        bound += max(values) if is_oco else sum(values)
+        complete = complete and all(child_complete for _, child_complete in child_bounds)
+    return bound, complete
 
 
 def order_value(order_spec: dict[str, Any], preview_value: float | None) -> float:
     """Estimate an order's value in dollars, conservatively.
 
     Each node with legs is valued at its highest price times its largest leg
-    quantity (times 100 for options); Schwab's preview order value counts
-    too, and the largest figure wins. A node without a price (market, trailing
-    stop) needs the preview value. Raises ``PermissionError`` when the value
-    cannot be determined, since the cap cannot be enforced.
+    quantity (times 100 for options). Composites follow their strategy: an OCO
+    takes its largest child, a TRIGGER adds its stages. Schwab's preview order
+    value counts too, and the larger figure wins. When any node has no usable
+    price (market, trailing stop, net-zero, a zero price), only a positive,
+    finite preview value can bound the order. Raises ``PermissionError`` when
+    the value cannot be determined, since the cap cannot be enforced.
     """
-    values: list[float] = []
-    unknown = False
-    for node in _nodes(order_spec):
-        legs = _legs(node)
-        if not legs:
-            continue
-        value = _node_value(node, legs)
-        if value is None:
-            unknown = True
-        else:
-            values.append(value)
-    if preview_value is not None and math.isfinite(preview_value):
-        values.append(abs(preview_value))
-    elif unknown:
-        values = []
-    if not values:
+    bound, complete = _strategy_bound(order_spec)
+    preview = abs(preview_value) if preview_value is not None and math.isfinite(preview_value) else 0.0
+    if not complete and preview <= 0:
+        bound = 0.0
+    value = max(bound, preview)
+    if value <= 0:
         raise PermissionError(
             "Refusing order: its value cannot be determined from its prices or Schwab's preview, "
             "so the max order value cannot be enforced."
         )
-    return max(values)
+    return value
 
 
 def _allowlist_symbol(leg: dict[str, Any]) -> str:

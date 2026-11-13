@@ -10,17 +10,23 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import stat
 from collections.abc import Awaitable, Callable
 from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 from conftest import make_ctx, run, working_order
+from mcp.server.mcpserver import Context as MCPContext, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from schwab.client import AsyncClient
 
+from schwab_mcp import tools as tools_module
 from schwab_mcp.approvals import ApprovalDecision, ApprovalManager, ApprovalRequest
-from schwab_mcp.context import SchwabContext
+from schwab_mcp.context import SchwabContext, SchwabServerContext
 from schwab_mcp.limits import OrderLedger, TradingLimits, check_order, order_value, parse_symbol_allowlist
 from schwab_mcp.previews import PreviewOperation
 from schwab_mcp.tools import orders
@@ -98,18 +104,120 @@ def test_composite_value_is_the_largest_node() -> None:
     assert order_value(oco, None) == 1_500.0
 
 
-@pytest.mark.parametrize("preview_value", [None])
-def test_unknown_value_is_refused(preview_value: float | None) -> None:
+@pytest.mark.parametrize(
+    "preview_value",
+    [None, 0.0, -0.0, float("nan"), float("inf"), float("-inf")],
+    ids=["missing", "zero", "negative-zero", "nan", "inf", "-inf"],
+)
+def test_unknown_value_needs_a_positive_finite_preview_value(preview_value: float | None) -> None:
     with pytest.raises(PermissionError, match="value cannot be determined"):
-        order_value(equity_spec(price=None), preview_value)
+        order_value(equity_spec(quantity=100_000, price=None), preview_value)
+
+
+def test_zero_preview_value_never_passes_a_large_market_order() -> None:
+    with pytest.raises(PermissionError, match="value cannot be determined"):
+        check_order(
+            TradingLimits(max_order_value=1.0, max_daily_orders=3), equity_spec(quantity=100_000, price=None), 0.0
+        )
+
+
+def test_negative_preview_value_counts_by_size() -> None:
+    assert order_value(equity_spec(price=None), -2_500.0) == 2_500.0
+
+
+@pytest.mark.parametrize("price", ["0", "0.00", "-1.00"])
+def test_a_zero_or_negative_price_is_not_a_bound(price: str) -> None:
+    with pytest.raises(PermissionError, match="value cannot be determined"):
+        order_value(equity_spec(quantity=100, price=price), None)
+    assert order_value(equity_spec(quantity=100, price=price), 900.0) == 900.0
+
+
+def test_net_zero_combo_needs_a_positive_preview_value() -> None:
+    combo = {
+        "orderType": "NET_ZERO",
+        "orderStrategyType": "SINGLE",
+        "orderLegCollection": [
+            {
+                "instruction": "BUY_TO_OPEN",
+                "quantity": 10,
+                "instrument": {"symbol": "SPY   251219C00500000", "assetType": "OPTION"},
+            },
+            {
+                "instruction": "SELL_TO_OPEN",
+                "quantity": 10,
+                "instrument": {"symbol": "SPY   251219C00510000", "assetType": "OPTION"},
+            },
+        ],
+    }
+
+    with pytest.raises(PermissionError, match="value cannot be determined"):
+        order_value(combo, 0.0)
+    assert order_value(combo, 4_000.0) == 4_000.0
+
+
+# --- composite strategies --------------------------------------------------------
+
+
+def sell_spec(quantity: int = 100, price: str = "120.00") -> dict[str, Any]:
+    spec = equity_spec(quantity=quantity, price=price)
+    spec["orderLegCollection"][0]["instruction"] = "SELL"
+    return spec
+
+
+def trigger(parent: dict[str, Any], *children: dict[str, Any]) -> dict[str, Any]:
+    return {**parent, "orderStrategyType": "TRIGGER", "childOrderStrategies": list(children)}
+
+
+def oco(*children: dict[str, Any]) -> dict[str, Any]:
+    return {"orderStrategyType": "OCO", "childOrderStrategies": list(children)}
+
+
+def test_trigger_value_adds_the_parent_and_its_child() -> None:
+    buy_then_buy = trigger(equity_spec(quantity=100, price="100.00"), equity_spec(quantity=100, price="100.00"))
+
+    assert order_value(buy_then_buy, None) == 20_000.0
+    with pytest.raises(PermissionError, match=r"\$20,000.00 exceeds the \$15,000.00 max order value"):
+        check_order(TradingLimits(max_order_value=15_000.0, max_daily_orders=3), buy_then_buy, None)
+
+
+def test_bracket_adds_the_entry_and_its_largest_exit() -> None:
+    bracket = trigger(
+        equity_spec(quantity=100, price="100.00"), oco(sell_spec(price="120.00"), sell_spec(price="90.00"))
+    )
+
+    assert order_value(bracket, None) == 10_000.0 + 12_000.0
+
+
+def test_nested_strategies_combine_by_kind() -> None:
+    nested = oco(
+        trigger(equity_spec(quantity=10, price="100.00"), equity_spec(quantity=10, price="50.00")),
+        equity_spec(quantity=10, price="120.00"),
+    )
+
+    assert order_value(nested, None) == 1_500.0
+
+
+def test_preview_value_still_raises_a_composite_bound() -> None:
+    bracket = trigger(equity_spec(quantity=100, price="100.00"), oco(sell_spec(price="120.00")))
+
+    assert order_value(bracket, 50_000.0) == 50_000.0
+
+
+def test_unpriced_trigger_stage_makes_the_value_unknown_without_a_preview() -> None:
+    unpriced_child = trigger(equity_spec(quantity=100, price="100.00"), equity_spec(quantity=100, price=None))
+
+    with pytest.raises(PermissionError, match="value cannot be determined"):
+        order_value(unpriced_child, None)
+    with pytest.raises(PermissionError, match="value cannot be determined"):
+        order_value(unpriced_child, 0.0)
 
 
 def test_one_unpriced_node_needs_the_preview_value() -> None:
-    trigger = {**equity_spec(quantity=10, price="150.00"), "childOrderStrategies": [equity_spec(price=None)]}
+    staged = {**equity_spec(quantity=10, price="150.00"), "childOrderStrategies": [equity_spec(price=None)]}
 
     with pytest.raises(PermissionError, match="value cannot be determined"):
-        order_value(trigger, None)
-    assert order_value(trigger, 1_600.0) == 1_600.0
+        order_value(staged, None)
+    assert order_value(staged, 1_600.0) == 1_600.0
 
 
 # --- check_order ---------------------------------------------------------------------
@@ -437,3 +545,76 @@ def test_cap_filled_by_another_process_after_approval_is_reported(tmp_path: Path
     [(outcome, succeeded)] = outcomes
     assert outcome.startswith("not sent: Refusing order: the daily cap of 1 orders is reached")
     assert succeeded is False
+
+
+# --- through the registered MCP tool runner ---------------------------------------
+
+
+class RegisteredHarness:
+    """Real tool registration and argument validation, fake Schwab client."""
+
+    def __init__(self, limits: TradingLimits, preview: Any = None) -> None:
+        self.server = MCPServer(name="limits")
+        self.client = Client(preview)
+        self.approvals = Approvals()
+        tools_module.register_tools(
+            self.server, cast(AsyncClient, self.client), allow_write=True, enable_technical=False
+        )
+        lifespan_context = SchwabServerContext(
+            client=cast(AsyncClient, self.client),
+            approval_manager=self.approvals,
+            trading_limits=limits,
+            order_ledger=OrderLedger(None),
+        )
+        request_context = SimpleNamespace(lifespan_context=lifespan_context, request_id="request-1", meta=None)
+        self.context = MCPContext.model_construct(_request_context=cast(Any, request_context), _mcp_server=self.server)
+
+    def call(self, name: str, arguments: dict[str, Any]) -> Any:
+        return run(self.server.call_tool(name, arguments, self.context))
+
+    def refused(self, name: str, arguments: dict[str, Any], pattern: str) -> None:
+        """The registered tool fails with a PermissionError matching ``pattern``."""
+        with pytest.raises(ToolError) as excinfo:
+            self.call(name, arguments)
+        cause = excinfo.value.__cause__
+        assert isinstance(cause, PermissionError), repr(cause)
+        assert re.search(pattern, str(cause)), str(cause)
+
+    def preview_id(self, name: str, arguments: dict[str, Any]) -> str:
+        result = self.call(name, arguments)
+        assert not result.is_error, result
+        return json.loads(result.content[0].text)["preview_id"]
+
+
+_ENTRY = {"symbol": "AAPL", "quantity": 100, "instruction": "BUY", "order_type": "LIMIT", "price": 100.0}
+
+
+def test_registered_same_direction_trigger_is_refused_over_the_cap() -> None:
+    harness = RegisteredHarness(TradingLimits(max_order_value=15_000.0, max_daily_orders=3))
+    preview_id = harness.preview_id(
+        "preview_trigger_order", {"account_hash": ACCOUNT, "entry_order": _ENTRY, "exit_orders": [_ENTRY]}
+    )
+
+    harness.refused(
+        "place_previewed_order", {"account_hash": ACCOUNT, "preview_id": preview_id}, r"\$20,000.00 exceeds"
+    )
+
+    assert harness.approvals.requests == []
+    assert harness.client.calls == []
+
+
+@pytest.mark.parametrize("preview_value", [0.0, None])
+def test_registered_market_order_with_no_usable_preview_value_is_refused(preview_value: float | None) -> None:
+    preview = {"orderStrategy": {"orderValue": preview_value}} if preview_value is not None else {}
+    harness = RegisteredHarness(TradingLimits(max_order_value=1.0, max_daily_orders=3), preview=preview)
+    preview_id = harness.preview_id(
+        "preview_equity_order",
+        {"account_hash": ACCOUNT, "symbol": "AAPL", "quantity": 100_000, "instruction": "BUY", "order_type": "MARKET"},
+    )
+
+    harness.refused(
+        "place_previewed_order", {"account_hash": ACCOUNT, "preview_id": preview_id}, "value cannot be determined"
+    )
+
+    assert harness.approvals.requests == []
+    assert harness.client.calls == []
